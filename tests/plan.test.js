@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, recentDays, priceRating, kmOn, startOfDay, addDays, atTime } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -207,11 +207,105 @@ test("planner uses midday on a WFH day and nights on a commute day", () => {
     const d = new Date(b.start);
     assert.ok(d.getDay() === 5 && d.getHours() >= 10 && d.getHours() < 15, `WFH charge at ${d}`);
   }
-  assert.strictEqual(decide(wfh.P, wfh.now, wfh.s).title, `Charge tomorrow ${String(new Date(wfh.P.blocks[0].start).getHours()).padStart(2, "0")}:00`);
+  assert.strictEqual(decide(wfh.P, wfh.now, wfh.s).title, `Charge tomorrow ${hm5(wfh.P.blocks[0].start)}`);
   // Monday evening, Tuesday commute: car is away at midday, so it charges overnight
   const commute = plan1("2026-10-19T20:00", () => {});
   for (const b of commute.P.blocks) assert.ok(new Date(b.start).getHours() < 7, `commute-day charge at ${new Date(b.start)}`);
   assert.strictEqual(decide(commute.P, commute.now, commute.s).title, "Charge tonight");
+});
+
+test("charging windows are unbroken and match the planned energy", () => {
+  const H = 3600e3;
+  for (const [iso, soc] of [["2026-10-19T21:00", 20], ["2026-10-19T21:00", 45], ["2026-10-19T21:20", 10], ["2026-10-22T20:00", 15], ["2026-10-24T18:00", 5]]) {
+    const { P, s, now } = run(iso, s => { s.soc = soc; });
+    const kw = s.chargerKw * s.effPct / 100;   // battery kWh per hour
+    let prevEnd = -Infinity;
+    for (const b of P.blocks) {
+      assert.ok(b.start >= now.getTime() - 1 && b.start >= prevEnd, `${iso}: windows ordered and not before now`);
+      // window length × charger power = battery energy in the window, so charging never pauses inside it
+      const energy = b.kwh * s.effPct / 100;
+      assert.ok(Math.abs((b.end - b.start) / H * kw - energy) < 0.02, `${iso} ${soc}%: ${hhmm(b.start)}–${hhmm(b.end)} ${energy.toFixed(2)} kWh`);
+      // and the slots inside it hold exactly that energy
+      const inside = P.slots.filter(sl => sl.t + H > b.start && sl.t < b.end).reduce((a, sl) => a + sl.charge, 0);
+      assert.ok(Math.abs(inside - energy) < 0.02, `${iso}: slots inside window`);
+      prevEnd = b.end;
+    }
+  }
+});
+
+test("car setup: limit is the level after the session rounded up to 10% (min 50%), timers in 5-minute steps", () => {
+  const { P, s, now } = run("2026-10-19T21:00", s => { s.soc = 20; });
+  const d = decide(P, now, s);
+  const next = P.events.find(e => e.check);
+  // nothing charges between the session and departure here, so the limit is the level at departure, rounded up
+  // to the car's 10% steps
+  const planned = next.lvlBefore / P.B * 100;
+  assert.strictEqual(d.setup.limit, Math.max(50, Math.ceil(planned / 10) * 10));
+  assert.ok(d.setup.limit >= planned && d.setup.limit % 10 === 0);
+  for (const t of d.setup.timers) {
+    const m = t.match(/^(now|(\d\d):(\d\d))–(\d\d):(\d\d)$/);
+    assert.ok(m, t);
+    if (m[3]) assert.strictEqual(+m[3] % 5, 0, t);
+    assert.strictEqual(+m[5] % 5, 0, t);
+  }
+  assert.ok(d.setup.timers.length === 1 || /timer windows/.test(d.setup.hint), d.setup.hint);
+});
+
+test("setup hint: run to the end of the hour only when the 10% limit matches the plan", () => {
+  const H = 3600e3, s = clone(DEF), now = new Date("2026-10-19T21:00");
+  const dep = new Date("2026-10-20T07:30").getTime(), start = new Date("2026-10-20T02:00").getTime();
+  const card = (end, pctEnd) => decide({ events: [{ t: dep, check: true, need: 13, lvlAfter: 20 }], slots: [], endLvl: 20, B: 58,
+    nextDrive: { t: dep, check: true }, mustKwh: 0, noChargeLvl: 30,
+    blocks: [{ start, end, kwh: 10, cost: 20, fc: false, lvlEnd: pctEnd / 100 * 58, hours: Math.ceil((end - start) / H) }] }, now, s).setup;
+  const midHour = start + 2 * H + 23 * 60e3;
+  // plan ends at 59.6%: the 60% limit stops it at the planned level, so the timer may run to 05:00
+  const exact = card(midHour, 59.6);
+  assert.deepStrictEqual([exact.limit, exact.timers[0]], [60, "02:00–04:25"]);
+  assert.ok(exact.hint.includes("until 05:00"), exact.hint);
+  // plan ends at 62.3%: the limit rounds up to 70%, so the timer sets the amount
+  const loose = card(midHour, 62.3);
+  assert.strictEqual(loose.limit, 70);
+  assert.ok(loose.hint.includes("timer sets the amount (to about 62%)") && !loose.hint.includes("until"), loose.hint);
+  // below the car's 50% minimum
+  assert.strictEqual(card(midHour, 34).limit, 50);
+  // ends on the hour: no extension tip
+  assert.ok(!card(start + 2 * H, 59.6).hint.includes("until"));
+});
+
+test("windows merge when it costs under the one-window setting, else the card offers one window and its extra cost", () => {
+  const H = 3600e3, now = new Date("2026-10-19T21:00"), s = clone(DEF); s.soc = 10;
+  const mk = spike => {
+    const d = demoData(now);
+    // flat night prices, with a spike at 02:00–03:00 between two cheap stretches
+    for (let h = 0; h < 7; h++) { const t = new Date(`2026-10-20T0${h}:00`).getTime(); d.prices.set(t, h === 2 ? 300 + spike : 300); }
+    for (const [t] of d.prices) { const h = new Date(t).getHours(); if (t > now.getTime() && (h >= 21 || h === 22 || h === 23)) d.prices.set(t, 2000); }
+    const { hours } = buildHours(d.prices, d.weather, s, now);
+    const P = plan(hours, s, now);
+    return { P, d: decide(P, now, s) };
+  };
+  // a small spike isn't worth a second timer: one window
+  assert.strictEqual(mk(30).d.setup.timers.length, 1, mk(30).d.setup.timers.join(", "));
+  // ...unless the setting says never pay extra for one window
+  s.oneWindowKr = 0; assert.strictEqual(mk(30).d.setup.timers.length, 2); s.oneWindowKr = DEF.oneWindowKr;
+  // a big spike is: two windows, plus the single-window option with its extra cost
+  const big = mk(3000);
+  assert.ok(big.d.setup.timers.length === 2, big.d.setup.timers.join(", "));
+  assert.match(big.d.setup.hint, /If only one window is possible, use (now|\d\d:\d\d)–\d\d:\d\d \(≈ \d+,\d\d kr more\)/);
+  const sess = big.P.blocks.slice(0, 2), one = oneWindow(big.P, sess, s, now);
+  const kw = s.chargerKw * s.effPct / 100, E = sess.reduce((a, b) => a + b.kwh * s.effPct / 100, 0);
+  assert.ok(Math.abs((one.end - one.start) / H * kw - E) < 0.02, "one window holds the same energy");
+  assert.ok(one.extra >= DEF.oneWindowKr, `extra ${one.extra}`);
+  // with a high enough setting even the big spike is merged into one window
+  s.oneWindowKr = 50; assert.strictEqual(mk(3000).d.setup.timers.length, 1); s.oneWindowKr = DEF.oneWindowKr;
+});
+
+test("5-minute rounding never shortens a window", () => {
+  const t = new Date("2026-10-20T02:23:10").getTime();
+  assert.strictEqual(hhmm(round5(t, false)), "02:20");
+  assert.strictEqual(hhmm(round5(t, true)), "02:25");
+  const exact = new Date("2026-10-20T02:25:00").getTime();
+  assert.strictEqual(hhmm(round5(exact + 0.4, true)), "02:25");   // float noise doesn't add 5 minutes
+  assert.strictEqual(hhmm(round5(exact, false)), "02:25");
 });
 
 test("planner reports what must be charged before the next drive", () => {
