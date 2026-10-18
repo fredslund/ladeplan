@@ -13,7 +13,7 @@
 :root{
   --bg:#f1f4f6; --surface:#ffffff; --ink:#14212b; --muted:#5b6b77; --line:#d8dfe4;
   --known:#2f6584; --forecast:#a9bfcc; --charge:#d98200; --charge-soft:#fbe9cc;
-  --good:#2e7a4c; --warn:#b3261e; --away:#e6ebee;
+  --good:#2e7a4c; --warn:#b3261e; --away:#e6ebee; --good-soft:#dcefe3; --warn-soft:#f8dcd9;
   --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
   color-scheme:light;
@@ -21,7 +21,7 @@
 @media (prefers-color-scheme:dark){:root{
   --bg:#0e161c; --surface:#16212a; --ink:#e5edf2; --muted:#93a4b0; --line:#2a3843;
   --known:#6ea4c2; --forecast:#3e5868; --charge:#f2a93b; --charge-soft:#3a2c14;
-  --good:#5fbf86; --warn:#ff8a80; --away:#1b2832; color-scheme:dark;}}
+  --good:#5fbf86; --warn:#ff8a80; --away:#1b2832; --good-soft:#173324; --warn-soft:#3b1a18; color-scheme:dark;}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 var(--sans);
@@ -35,6 +35,13 @@ h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
 .decision{border-left:5px solid var(--charge)}
 .decision.ok{border-left-color:var(--good)}
 .decision.bad{border-left-color:var(--warn)}
+.decision.fc{border-left-color:var(--forecast)}
+.decision .lvl{display:inline-block;font:600 11px var(--sans);text-transform:uppercase;letter-spacing:.06em;padding:2px 8px;border-radius:99px;margin:0 0 8px;background:var(--charge-soft);color:var(--charge)}
+.decision .lvl:empty{display:none}
+.decision.must .lvl{background:var(--charge);color:var(--surface)}
+.decision.fc .lvl{background:var(--away);color:var(--muted)}
+.decision.ok .lvl{background:var(--good-soft);color:var(--good)}
+.decision.bad .lvl{background:var(--warn-soft);color:var(--warn)}
 .decision h2{margin:0 0 4px;font-size:21px;text-wrap:balance;line-height:1.25}
 .decision .big{font:500 15px var(--mono);margin:6px 0 2px}
 .decision p{margin:6px 0 0;color:var(--muted)}
@@ -107,6 +114,7 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
   </section>
 
   <section class="card decision" id="decision">
+    <span class="lvl" id="dLvl"></span>
     <h2 id="dTitle">Fetching prices…</h2>
     <div class="big" id="dBig"></div>
     <p id="dSub"></p>
@@ -426,6 +434,13 @@ function plan(hours, s, now){
   const res=B*s.reserve/100, soc0=B*s.soc/100;
   const end = hours.length ? hours[hours.length-1].t+H : nowMs;
   const events=drivesFor(s, now, end).sort((a,b)=>a.t-b.t);
+  // Energy that must be charged before the next departure to keep the reserve, whatever the price.
+  const nextDrive=events.find(e=>e.check);
+  let mustKwh=0, noChargeLvl=null;
+  if (nextDrive){
+    let used=0; for (const e of events){ used+=e.need; if (e===nextDrive) break; }
+    noChargeLvl=soc0-used; mustKwh=Math.max(0, res-noChargeLvl);
+  }
   const away=(t0,t1)=>events.some(e=>{ const dep=e.returning?nowMs:e.t; return t0<e.back && t1>dep; });
   const slots=hours.map(h=>{
     const st=Math.max(h.t,nowMs), frac=(h.t+H-st)/H;
@@ -473,7 +488,7 @@ function plan(hours, s, now){
       else { cur={start:Math.max(sl.t,nowMs), end:sl.t+H, kwh:grid, cost, fc:sl.fc}; blocks.push(cur); }
     } else cur=null;
   });
-  return { slots, events, blocks, endLvl, B };
+  return { slots, events, blocks, endLvl, B, nextDrive, mustKwh, noChargeLvl, res };
 }
 
 /* ---------- rendering ---------- */
@@ -482,45 +497,64 @@ let DATA=null, MODEL=null, DEMO=false;
 const fmtKr = v => v.toFixed(2).replace(".",",");
 const pct = (kwh,B) => Math.round(kwh/B*100);
 
-// Headline for the decision card; pure so it can be tested. cls: "" (charge), "ok" or "bad".
+// Decision card, pure so it can be tested. Two questions decide the level:
+// is charging needed before the next drive (else it's just price-driven), and is the price known or forecast.
+// cls: "bad" | "must" | "" (optional, known price) | "fc" (optional, forecast) | "ok" (no charging tonight)
 function decide(P, now, s){
   const short=P.events.find(e=>e.short>0);
   const first=P.blocks[0];
   const tonightEnd=atTime(addDays(startOfDay(now),1),s.depart).getTime();
-  const nextDrive=P.events.find(e=>e.check);
-  if (short) return { cls:"bad",
-    title:`Not enough time to charge for ${dayLabel(short.t,now).toLowerCase()}`,
+  const nextDrive=P.nextDrive || P.events.find(e=>e.check);
+  const day = t => { const l=dayLabel(t,now); return l==="Today"||l==="Tomorrow" ? l.toLowerCase() : l; };
+  if (short) return { cls:"bad", lvl:"Not enough",
+    title:`Not enough time to charge for ${day(short.t)}`,
     big:`${short.need.toFixed(1)} kWh needed · ${short.short.toFixed(1)} kWh short`,
     sub:"Charge as soon as you can, or lower the reserve or trip length." };
   if (!first){
     const last=P.slots.length?P.slots[P.slots.length-1].t:now.getTime();
-    return { cls:"ok", title:"No charging needed",
+    return { cls:"ok", lvl:"Not needed", title:"No charging needed",
       big:`Battery ends around ${pct(P.endLvl,P.B)}% on ${DOW[new Date(last).getDay()]}`,
       sub:"Your commute is covered with your reserve intact for the days shown." };
   }
-  const label=`${dayLabel(first.start,now)} ${hhmm(first.start)}–${hhmm(first.end)}`;
-  const avg=fmtKr(first.cost/first.kwh);
-  if (first.start<tonightEnd && !first.fc){
-    const hrs=new Date(first.start).getHours();
-    return { cls:"",
-      title: first.start<=now.getTime()+H ? "Charge now" : (hrs>=18 || hrs<9 || dayLabel(first.start,now)!=="Today") ? "Charge tonight" : "Charge today",
-      big:`${label} · ${first.kwh.toFixed(1)} kWh · ≈ ${Math.round(first.cost)} kr`,
-      sub:`Average ${avg} kr/kWh, based on known prices.` + (P.blocks.length>1?` ${P.blocks.length-1} more charging window${P.blocks.length>2?"s":""} planned later.`:"") };
+  // Summarise all charging before tomorrow's departure, not just the first window.
+  const tonight=first.start<tonightEnd;
+  const win=tonight ? P.blocks.filter(b=>b.start<tonightEnd) : [first], lastW=win[win.length-1];
+  const kwh=win.reduce((a,b)=>a+b.kwh,0), cost=win.reduce((a,b)=>a+b.cost,0), fc=win.some(b=>b.fc);
+  const label=`${dayLabel(first.start,now)} ${hhmm(first.start)}–${hhmm(lastW.end)}`;
+  const avg=fmtKr(cost/kwh);
+  const fcNote=" Hours are based on forecast prices; check again after 13:00.";
+  const windows = win.length>1 ? ` Split into ${win.length} windows, see the plan below.` : "";
+  const must=(P.mustKwh||0)>0.05 && nextDrive;
+  const hrs=new Date(first.start).getHours();
+  const verb = first.start<=now.getTime()+H ? "Charge now" : (hrs>=18 || hrs<9 || dayLabel(first.start,now)!=="Today") ? "Charge tonight" : "Charge today";
+  const big=`${label} · ${kwh.toFixed(1)} kWh · ≈ ${Math.round(cost)} kr${fc?" (forecast)":""}`;
+  if (must){
+    const p=pct(P.noChargeLvl,P.B), needGrid=P.mustKwh/(s.effPct/100);
+    const without = p<=0 ? `Without charging you'd run out before getting home from ${day(nextDrive.t)}'s drive.`
+      : `Without charging you'd get home from ${day(nextDrive.t)}'s drive with ${p}%, below your ${s.reserve}% reserve.`;
+    const extra = tonight && kwh-needGrid>1 ? ` At least ${needGrid.toFixed(1)} kWh is needed; the rest is cheaper now than later.` : "";
+    if (tonight) return { cls:"must", lvl:`Needed for ${day(nextDrive.t)}`, title:verb, big,
+      sub: without + extra + windows + (fc ? fcNote : ` Average ${avg} kr/kWh.`) };
+    return { cls:"", lvl:`Needed before ${day(nextDrive.t)}`,
+      title:`Wait, charge ${dayLabel(first.start,now).toLowerCase()} ${hhmm(first.start)}`, big,
+      sub:`You need ${needGrid.toFixed(1)} kWh before ${day(nextDrive.t)} ${hhmm(nextDrive.t)}, but it's cheaper later than tonight.` + (fc ? fcNote : "") };
   }
-  if (first.start<tonightEnd) return { cls:"",
-    title:"Probably charge tonight",
-    big:`${label} · ${first.kwh.toFixed(1)} kWh (forecast)`,
-    sub:`Expected ≈ ${avg} kr/kWh. Check again after 13:00 when tomorrow's prices are published.` };
-  return { cls:"ok",
+  if (tonight && !fc) return { cls:"", lvl:"Optional · good price", title:verb, big,
+    sub: (nextDrive ? `Not needed for ${day(nextDrive.t)} yet, but this is the cheapest time in the plan.` : "Below your always-fill price.")
+      + ` Average ${avg} kr/kWh.` + windows };
+  if (tonight) return { cls:"fc", lvl:"Forecast", title:"Probably charge tonight", big,
+    sub:`Not needed yet, but tonight looks cheapest. Expected ≈ ${avg} kr/kWh.` + fcNote };
+  return { cls:"ok", lvl:"Not needed tonight",
     title:"Wait, no need to charge tonight",
     big:`Next: ${label} · ${first.kwh.toFixed(1)} kWh${first.fc?" (forecast)":""}`,
     sub: first.fc
-      ? `Expected ≈ ${avg} kr/kWh. ${nextDrive?`You still reach home from ${dayLabel(nextDrive.t,now).toLowerCase()}'s commute with ${pct(nextDrive.lvlAfter,P.B)}%. `:""}Check again after 13:00 when tomorrow's prices are published.`
+      ? `Expected ≈ ${avg} kr/kWh. ${nextDrive?`You still reach home from ${day(nextDrive.t)}'s commute with ${pct(nextDrive.lvlAfter,P.B)}%. `:""}Check again after 13:00 when tomorrow's prices are published.`
       : `Known price ≈ ${avg} kr/kWh.` };
 }
 function renderDecision(P, now){
   const d=decide(P, now, S);
   document.getElementById("decision").className="card decision"+(d.cls?" "+d.cls:"");
+  document.getElementById("dLvl").textContent=d.lvl;
   document.getElementById("dTitle").textContent=d.title;
   document.getElementById("dBig").textContent=d.big;
   document.getElementById("dSub").textContent=d.sub;
@@ -676,7 +710,7 @@ async function load(){
   } catch(e){
     DATA=null;
     stamp.textContent="offline";
-    const box=document.getElementById("decision"); box.className="card decision bad";
+    const box=document.getElementById("decision"); box.className="card decision bad"; document.getElementById("dLvl").textContent="";
     document.getElementById("dTitle").textContent="Couldn't load prices";
     document.getElementById("dBig").textContent=String(e.message||e);
     document.getElementById("dSub").innerHTML='Check your connection and tap Refresh. The page must be opened from a normal web address. <button class="linkbtn" type="button" id="tryDemo">Show example data</button>';
