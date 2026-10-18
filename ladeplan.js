@@ -79,7 +79,13 @@ function tariff(t, s){
   const d=new Date(t), h=d.getHours(), g=isTariffWinter(t) ? s.t.winter : s.t.summer;
   return h<6 ? g.night : (h>=17 && h<21) ? g.peak : g.day;
 }
-function totalPrice(spotMWh, t, s){ return (spotMWh/1000 + s.t.supplier + tariff(t,s) + s.t.energinet + s.t.elafgift) * 1.25; }
+// Final price per kWh split into its parts, each incl. 25% VAT, in kr/kWh. fees = everything except spot.
+function priceParts(spotMWh, t, s){
+  const v=1.25, p={ spot:spotMWh/1000*v, grid:tariff(t,s)*v, energinet:s.t.energinet*v, elafgift:s.t.elafgift*v, supplier:s.t.supplier*v };
+  p.fees=p.grid+p.energinet+p.elafgift+p.supplier; p.total=p.spot+p.fees;
+  return p;
+}
+function totalPrice(spotMWh, t, s){ return priceParts(spotMWh,t,s).total; }
 
 /* ---------- forecast model ---------- */
 const wpow = ws => Math.min(1, Math.max(0, (ws-3)/9));   // rough wind-turbine output curve, 0..1
@@ -162,7 +168,8 @@ function buildHours(prices, weather, s, now){
       spot=model.pred(features(t,w)); fc=true;
       sig=model.sigma*Math.min(1.6, 1+(t-startH)/(72*H));   // uncertainty grows with lead time
     }
-    hours.push({ t, spot, fc, price: totalPrice(spot,t,s), sigma: sig/1000*1.25 });
+    const parts=priceParts(spot,t,s);
+    hours.push({ t, spot, fc, parts, price: parts.total, sigma: sig/1000*1.25 });
   }
   return { hours, model };
 }
@@ -306,6 +313,6 @@ function decide(P, now, s){
 export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, dayLabel,
-  SEASON, consFor, isTariffWinter, tariff, totalPrice, wpow, features, fitModel, parsePrices, demoData,
+  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData,
   buildHours, drivesFor, plan, fmtKr, pct, decide
 };

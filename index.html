@@ -12,7 +12,7 @@
 /* Layout: one narrow column, decision card first, then chart, then settings in collapsible panels */
 :root{
   --bg:#f1f4f6; --surface:#ffffff; --ink:#14212b; --muted:#5b6b77; --line:#d8dfe4;
-  --known:#2f6584; --forecast:#a9bfcc; --charge:#d98200; --charge-soft:#fbe9cc;
+  --known:#2f6584; --forecast:#86a2b3; --charge:#d98200; --charge-soft:#fbe9cc;
   --good:#2e7a4c; --warn:#b3261e; --away:#e6ebee; --good-soft:#dcefe3; --warn-soft:#f8dcd9;
   --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
@@ -20,7 +20,7 @@
 }
 @media (prefers-color-scheme:dark){:root{
   --bg:#0e161c; --surface:#16212a; --ink:#e5edf2; --muted:#93a4b0; --line:#2a3843;
-  --known:#6ea4c2; --forecast:#3e5868; --charge:#f2a93b; --charge-soft:#3a2c14;
+  --known:#6ea4c2; --forecast:#4d6a7c; --charge:#f2a93b; --charge-soft:#3a2c14;
   --good:#5fbf86; --warn:#ff8a80; --away:#1b2832; --good-soft:#173324; --warn-soft:#3b1a18; color-scheme:dark;}}
 *{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
@@ -52,7 +52,14 @@ input[type=range]{width:100%;accent-color:var(--charge)}
 .hint{font-size:12.5px;color:var(--muted);margin:6px 0 0}
 .label{font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin:0 0 8px}
 .chartbox{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -4px}
-.chartbox svg{display:block}
+.chartbox svg{display:block;touch-action:pan-x}
+.chartbox:focus-visible{outline:2px solid var(--charge);outline-offset:2px;border-radius:4px}
+.readout{margin:8px 0 0;font-size:13px;color:var(--muted);min-height:2.9em;font-variant-numeric:tabular-nums}
+.readout strong{font:600 15px var(--mono);color:var(--ink);margin-right:6px}
+.readout span{display:block}
+.legend i.stack{display:inline-flex;flex-direction:column;gap:1px;height:12px;vertical-align:-2px;background:none}
+.legend i.stack b{flex:1;background:var(--muted);border-radius:1px}
+.legend i.stack b:first-child{opacity:.5}
 .legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--muted);margin-top:8px}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
 .timeline{display:flex;flex-direction:column;gap:0}
@@ -122,8 +129,10 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
 
   <section class="card">
     <p class="label">Total price per kWh, incl. tariffs and VAT</p>
-    <div class="chartbox" id="chart"></div>
+    <div class="chartbox" id="chart" tabindex="0" aria-label="Price chart. Use left and right arrow keys to read each hour." aria-describedby="chartRead"></div>
+    <p class="readout" id="chartRead" aria-live="polite"></p>
     <div class="legend">
+      <span><i class="stack"><b></b><b></b></i>Solid: spot price · light: tariffs, taxes &amp; VAT</span>
       <span><i style="background:var(--known)"></i>Known price</span>
       <span><i style="background:var(--forecast)"></i>Forecast (±1σ)</span>
       <span><i style="background:var(--charge)"></i>Planned charging</span>
@@ -278,11 +287,15 @@ function renderDecision(P, now){
   document.getElementById("dSub").textContent=d.sub;
 }
 
+let CHART_SEL=null;   // selected hour (ms) in the chart readout; kept across re-renders
 function renderChart(P, now){
   const el=document.getElementById("chart"), sl=P.slots;
-  if (!sl.length){ el.innerHTML=""; return; }
+  if (!sl.length){ el.innerHTML=""; document.getElementById("chartRead").textContent=""; return; }
   const bw=11, L=40, R=8, T=12, Hh=170, Bt=34, W=L+sl.length*bw+R, Ht=T+Hh+Bt;
-  const maxV=Math.max(1, ...sl.map(s=>s.price+s.sigma)), minV=Math.min(0, ...sl.map(s=>s.price-s.sigma));
+  // Each bar: spot from zero (solid), fees stacked on top (light); the top is the final price.
+  // With a negative spot, fees start at zero and a tick marks the actual total.
+  const feeTop=s=>Math.max(0,s.parts.spot)+s.parts.fees;
+  const maxV=Math.max(1, ...sl.map(s=>Math.max(s.price+s.sigma, feeTop(s)))), minV=Math.min(0, ...sl.map(s=>Math.min(s.price-s.sigma, s.parts.spot)));
   const step = maxV-minV>4 ? 1 : maxV-minV>1.6 ? 0.5 : 0.25;
   const top=Math.ceil(maxV/step)*step, bot=Math.floor(minV/step)*step;
   const y=v=>T+Hh*(top-v)/(top-bot);
@@ -295,11 +308,17 @@ function renderChart(P, now){
     const x=L+i*bw;
     if (!s.home) g+=`<rect x="${x}" y="${T}" width="${bw}" height="${Hh}" fill="var(--away)"/>`;
   });
+  g+=`<rect id="chartSel" x="0" y="${T}" width="${bw}" height="${Hh}" fill="var(--ink)" opacity=".08" visibility="hidden"/>`;
   sl.forEach((s,i)=>{
     const x=L+i*bw, d=new Date(s.t), h=d.getHours();
-    const y0=y(Math.max(0,s.price)), y1=y(Math.min(0,s.price));
     const col = s.charge>0.01 ? "var(--charge)" : s.fc ? "var(--forecast)" : "var(--known)";
-    g+=`<rect x="${x+1}" y="${y0}" width="${bw-2}" height="${Math.max(1,y1-y0)}" fill="${col}" rx="1"/>`;
+    const sp=s.parts.spot, base=Math.max(0,sp);
+    const sy0=y(Math.max(0,sp)), sy1=y(Math.min(0,sp));
+    g+=`<rect x="${x+1}" y="${sy0}" width="${bw-2}" height="${Math.max(1,sy1-sy0)}" fill="${col}"/>`;
+    // 2px surface gap between the spot and fee segments
+    const fy0=y(base+s.parts.fees), fy1=y(base)-2;
+    if (fy1-fy0>=1) g+=`<rect x="${x+1}" y="${fy0}" width="${bw-2}" height="${fy1-fy0}" fill="${col}" fill-opacity=".5" rx="1"/>`;
+    if (sp<0) g+=`<line x1="${x+1}" x2="${x+bw-1}" y1="${y(s.price)}" y2="${y(s.price)}" stroke="var(--ink)" stroke-width="1.5"/>`;
     if (s.fc && s.sigma>0){ const cx=x+bw/2; g+=`<line x1="${cx}" x2="${cx}" y1="${y(s.price+s.sigma)}" y2="${y(s.price-s.sigma)}" stroke="var(--muted)" stroke-width="1" opacity=".55"/>`; }
     if (h===0 || (i===0 && h<16)){
       g+=`<line x1="${x}" x2="${x}" y1="${T}" y2="${T+Hh+20}" stroke="var(--muted)" stroke-width="1" opacity=".5"/>`;
@@ -307,7 +326,38 @@ function renderChart(P, now){
     }
     if (h%6===0) g+=`<text x="${x+bw/2}" y="${T+Hh+13}" text-anchor="middle" font-size="10" fill="var(--muted)" font-family="var(--mono)">${pad(h)}</text>`;
   });
+  // Hit targets: the whole column of each hour, wider than the bar
+  sl.forEach((s,i)=>{ g+=`<rect class="hit" data-i="${i}" x="${L+i*bw}" y="${T}" width="${bw}" height="${Hh+Bt}" fill="transparent"/>`; });
   el.innerHTML=`<svg width="${W}" height="${Ht}" viewBox="0 0 ${W} ${Ht}" role="img" aria-label="Hourly electricity price with planned charging">${g}</svg>`;
+
+  const read=document.getElementById("chartRead"), sel=el.querySelector("#chartSel");
+  const show=i=>{
+    const s=sl[i], p=s.parts, k=v=>fmtKr(v);
+    CHART_SEL=s.t;
+    sel.setAttribute("x", L+i*bw); sel.setAttribute("visibility","visible");
+    const note = s.charge>0.01 ? ` · charging ${(s.charge/(S.effPct/100)).toFixed(1)} kWh` : !s.home ? " · car away" : "";
+    read.replaceChildren();
+    const l1=document.createElement("span"), strong=document.createElement("strong");
+    strong.textContent=`${k(s.price)} kr/kWh`;
+    l1.append(strong, `${dayLabel(s.t,now)} ${hhmm(s.t)}–${hhmm(s.t+H)}${s.fc?` · forecast ±${k(s.sigma)}`:""}${note}`);
+    const l2=document.createElement("span");
+    l2.textContent=`Spot ${s.fc?"≈ ":""}${k(p.spot)} + grid tariff ${k(p.grid)} + Energinet ${k(p.energinet)} + supplier ${k(p.supplier)} + elafgift ${k(p.elafgift)}, all incl. VAT`;
+    read.append(l1,l2);
+  };
+  // Default: keep the previous selection, else the first planned charging hour, else the first hour
+  let cur=sl.findIndex(s=>s.t===CHART_SEL);
+  if (cur<0) cur=Math.max(0, sl.findIndex(s=>s.charge>0.01));
+  show(cur);
+  const svg=el.querySelector("svg");
+  const pick=e=>{ const h=e.target.closest(".hit"); if (h){ cur=+h.dataset.i; show(cur); } };
+  svg.addEventListener("pointermove", pick);
+  svg.addEventListener("pointerdown", pick);
+  el.onkeydown=e=>{
+    if (e.key!=="ArrowLeft" && e.key!=="ArrowRight") return;
+    e.preventDefault();
+    cur=Math.min(sl.length-1, Math.max(0, cur+(e.key==="ArrowRight"?1:-1))); show(cur);
+    const x=L+cur*bw; if (x<el.scrollLeft+L || x>el.scrollLeft+el.clientWidth-bw) el.scrollLeft=x-el.clientWidth/2;
+  };
 }
 
 function renderTimeline(P, now){

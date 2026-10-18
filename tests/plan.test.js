@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -122,6 +122,24 @@ test("grid tariff follows season and hour band", () => {
   assert.strictEqual(at("2026-04-01T03:00"), s.t.summer.night);
   assert.strictEqual(at("2026-09-30T22:00"), s.t.summer.day);
   assert.strictEqual(at("2026-07-14T20:59"), s.t.summer.peak);
+});
+
+test("price parts add up to the final price shown on the chart", () => {
+  const s = clone(DEF);
+  for (const [spot, iso] of [[1350, "2026-10-19T02:00"], [1210, "2026-10-19T13:00"], [-200, "2026-07-12T13:00"]]) {
+    const t = new Date(iso).getTime(), p = priceParts(spot, t, s);
+    assert.ok(Math.abs(p.spot + p.fees - p.total) < 1e-12);
+    assert.ok(Math.abs(p.total - totalPrice(spot, t, s)) < 1e-12);
+    assert.ok(Math.abs(p.grid - tariff(t, s) * 1.25) < 1e-12);
+    assert.ok(Math.abs(p.spot - spot / 1000 * 1.25) < 1e-12);
+  }
+  // Monday 19 Oct 2026, real spot: 13:00 is cheaper spot but dearer in total than 02:00 (winter day tariff)
+  const at = (spot, iso) => priceParts(spot, new Date(iso).getTime(), s);
+  assert.ok(at(1210, "2026-10-19T13:00").spot < at(1350, "2026-10-19T02:00").spot);
+  assert.ok(at(1210, "2026-10-19T13:00").total > at(1350, "2026-10-19T02:00").total);
+  // every planned hour carries its parts
+  const { hours } = run("2026-10-19T21:00");
+  for (const h of hours) assert.ok(Math.abs(h.parts.total - h.price) < 1e-12);
 });
 
 test("old flat tariffs migrate to both seasons", () => {
