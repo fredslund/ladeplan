@@ -1,24 +1,16 @@
 // Logic tests for Ladeplan. Runs without a browser or network.
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
-"use strict";
-const fs = require("fs");
-const path = require("path");
-const assert = require("assert");
+import fs from "node:fs";
+import assert from "node:assert";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
   process.exit(1);
 }
 
-// Pull the inline <script> out of index.html and expose its functions.
-const html = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
-let js = html.split("<script>")[1].split("</script>")[0];
-globalThis.localStorage = { getItem: () => null, setItem: () => {} };
-js += ";module.exports={demoData,buildHours,plan,drivesFor,consFor,totalPrice,DEF,clone,parsePrices,decide,loadSettings,tariff};";
-const mod = { exports: {} };
-new Function("module", js)(mod);
-const { demoData, buildHours, plan, DEF, clone, parsePrices, decide, loadSettings, tariff } = mod.exports;
-const fixture = name => JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", name), "utf8"));
+const fixture = name => JSON.parse(fs.readFileSync(new URL(`fixtures/${name}`, import.meta.url), "utf8"));
+const stored = p => settingsFrom(JSON.stringify(p));
 
 function run(iso, edit) {
   const now = new Date(iso);
@@ -115,15 +107,11 @@ test("forecast block tonight does not say wait", () => {
 });
 
 test("bad stored settings are clamped or reset", () => {
-  const orig = globalThis.localStorage.getItem;
-  globalThis.localStorage.getItem = () => JSON.stringify({ battery: 0, effPct: "x", maxSoc: 120, cons: { w: null } });
-  try {
-    const s = loadSettings();
-    assert.strictEqual(s.battery, 10);
-    assert.strictEqual(s.effPct, DEF.effPct);
-    assert.strictEqual(s.maxSoc, 100);
-    assert.strictEqual(s.cons.w, DEF.cons.w);
-  } finally { globalThis.localStorage.getItem = orig; }
+  const s = stored({ battery: 0, effPct: "x", maxSoc: 120, cons: { w: null } });
+  assert.strictEqual(s.battery, 10);
+  assert.strictEqual(s.effPct, DEF.effPct);
+  assert.strictEqual(s.maxSoc, 100);
+  assert.strictEqual(s.cons.w, DEF.cons.w);
 });
 
 test("grid tariff follows season and hour band", () => {
@@ -137,26 +125,18 @@ test("grid tariff follows season and hour band", () => {
 });
 
 test("old flat tariffs migrate to both seasons", () => {
-  const orig = globalThis.localStorage.getItem;
-  globalThis.localStorage.getItem = () => JSON.stringify({ t: { night: 0.11, day: 0.22, peak: 0.66, supplier: 0.02 } });
-  try {
-    const { t } = loadSettings();
-    assert.deepStrictEqual(t.winter, { night: 0.11, day: 0.22, peak: 0.66 });
-    assert.deepStrictEqual(t.summer, { night: 0.11, day: 0.22, peak: 0.66 });
-    assert.strictEqual(t.supplier, 0.02);
-    assert.ok(!("night" in t));
-  } finally { globalThis.localStorage.getItem = orig; }
+  const { t } = stored({ t: { night: 0.11, day: 0.22, peak: 0.66, supplier: 0.02 } });
+  assert.deepStrictEqual(t.winter, { night: 0.11, day: 0.22, peak: 0.66 });
+  assert.deepStrictEqual(t.summer, { night: 0.11, day: 0.22, peak: 0.66 });
+  assert.strictEqual(t.supplier, 0.02);
+  assert.ok(!("night" in t));
 });
 
 test("partial seasonal tariffs fill in defaults", () => {
-  const orig = globalThis.localStorage.getItem;
-  globalThis.localStorage.getItem = () => JSON.stringify({ t: { winter: { peak: 0.9 } } });
-  try {
-    const { t } = loadSettings();
-    assert.strictEqual(t.winter.peak, 0.9);
-    assert.strictEqual(t.winter.night, DEF.t.winter.night);
-    assert.deepStrictEqual(t.summer, DEF.t.summer);
-  } finally { globalThis.localStorage.getItem = orig; }
+  const { t } = stored({ t: { winter: { peak: 0.9 } } });
+  assert.strictEqual(t.winter.peak, 0.9);
+  assert.strictEqual(t.winter.night, DEF.t.winter.night);
+  assert.deepStrictEqual(t.summer, DEF.t.summer);
 });
 
 test("decision levels: needed vs optional vs forecast vs wait", () => {
@@ -189,22 +169,19 @@ test("planner reports what must be charged before the next drive", () => {
 });
 
 test("untouched old default tariffs move to N1 rates, edited ones stay", () => {
-  const orig = globalThis.localStorage.getItem;
-  const load = t => { globalThis.localStorage.getItem = () => JSON.stringify({ t }); return loadSettings().t; };
-  try {
-    // flat pre-seasonal default, copied to both seasons, then replaced
-    let t = load({ night: 0.15, day: 0.30, peak: 0.70 });
-    assert.deepStrictEqual(t.winter, DEF.t.winter);
-    assert.deepStrictEqual(t.summer, DEF.t.summer);
-    // seasonal old defaults
-    t = load({ winter: { night: 0.15, day: 0.30, peak: 0.70 }, summer: { night: 0.10, day: 0.15, peak: 0.35 } });
-    assert.deepStrictEqual(t.winter, DEF.t.winter);
-    assert.deepStrictEqual(t.summer, DEF.t.summer);
-    // one field edited: keep that season as is
-    t = load({ winter: { night: 0.15, day: 0.30, peak: 0.71 }, summer: { night: 0.10, day: 0.15, peak: 0.35 } });
-    assert.deepStrictEqual(t.winter, { night: 0.15, day: 0.30, peak: 0.71 });
-    assert.deepStrictEqual(t.summer, DEF.t.summer);
-  } finally { globalThis.localStorage.getItem = orig; }
+  const load = t => stored({ t }).t;
+  // flat pre-seasonal default, copied to both seasons, then replaced
+  let t = load({ night: 0.15, day: 0.30, peak: 0.70 });
+  assert.deepStrictEqual(t.winter, DEF.t.winter);
+  assert.deepStrictEqual(t.summer, DEF.t.summer);
+  // seasonal old defaults
+  t = load({ winter: { night: 0.15, day: 0.30, peak: 0.70 }, summer: { night: 0.10, day: 0.15, peak: 0.35 } });
+  assert.deepStrictEqual(t.winter, DEF.t.winter);
+  assert.deepStrictEqual(t.summer, DEF.t.summer);
+  // one field edited: keep that season as is
+  t = load({ winter: { night: 0.15, day: 0.30, peak: 0.71 }, summer: { night: 0.10, day: 0.15, peak: 0.35 } });
+  assert.deepStrictEqual(t.winter, { night: 0.15, day: 0.30, peak: 0.71 });
+  assert.deepStrictEqual(t.summer, DEF.t.summer);
 });
 
 test("N1 defaults give the published price incl. VAT", () => {

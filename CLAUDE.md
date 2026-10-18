@@ -4,7 +4,13 @@ A personal EV charging planner (VW ID.3, home charger, price area DK1). It answe
 
 ## How it works
 
-Single static file, `index.html`, no build step and no backend. Everything runs in the browser.
+Two static files, no build step and no backend. Everything runs in the browser.
+
+- `ladeplan.js`: ES module with all pure logic (settings defaults, limits and migration via `settingsFrom()`, time helpers, tariffs, the forecast model, `parsePrices()`, `plan()`, `decide()`, `demoData()`). No DOM, no `localStorage`, no network; the tests import it directly.
+- `index.html`: markup, CSS and a `<script type="module">` that imports `ladeplan.js` and does storage, fetching and rendering.
+- `package.json` only sets `"type": "module"` (so Node treats the `.js` files as ES modules) and an `npm test` alias.
+
+Module scripts don't run from `file://`, so open the page over HTTP (e.g. `python3 -m http.server`).
 
 1. **Prices**: day-ahead spot prices from elprisenligenu.dk (`/api/v1/prices/{YYYY}/{MM}-{DD}_{DK1|DK2}.json`, one file per day, free, no key, CORS open). Values are `DKK_per_kWh` excl. VAT; `parsePrices()` converts to DKK/MWh keyed by UTC hour and averages any sub-hourly records. The app fetches 22 past days + today + 2 ahead in parallel. Next-day files appear around 13:00 Danish time; before that they 404, and the 404 is cacheable for 4 h, so future days are fetched with `cache: "no-store"`. Energi Data Service was the original source but returns an empty body without CORS headers to browser requests (verified 2026-10-18), so it can't be called from the page.
 2. **Total price** per kWh = (spot/1000 + supplier markup + grid tariff + Energinet tariffs + elafgift) × 1.25 VAT. All tariff values are user settings. The grid tariff has hour bands (00–06, 06–17, 17–21 peak, 21–24) and two seasons, `t.winter` (Oct–Mar) and `t.summer` (Apr–Sep), picked by each hour's own date in `tariff()`. Old flat `t.night/day/peak` settings are copied to both seasons by `migrateTariffs()`.
@@ -21,16 +27,16 @@ Single static file, `index.html`, no build step and no backend. Everything runs 
 - Commute 39 km each way, usually one WFH day per week (configurable weekly pattern plus per-date km overrides).
 - Must arrive home with at least 10% battery.
 - 58 kWh usable battery, 11 kW AC charging.
-- Intended deployment: GitHub Pages, added to the phone home screen. Keep it a single self-contained file unless there's a strong reason not to.
+- Intended deployment: GitHub Pages, added to the phone home screen. Keep it static with no build step; split further only when a feature needs it (e.g. the backtest view).
 - UI copy is English; keep it plain and short. Mobile first (~390 px wide), light and dark themes via CSS tokens on `:root`.
 
 ## Tests
 
 ```
-TZ=Europe/Copenhagen node tests/plan.test.js
+TZ=Europe/Copenhagen node tests/plan.test.js   # or: npm test
 ```
 
-The test extracts the inline script from `index.html` and runs the planner and model on synthetic data (`demoData()`), plus price parsing on real sample files in `tests/fixtures/` (including the 25-hour DST day). No network needed. Keep pure logic free of DOM access so it stays testable this way.
+The test imports `ladeplan.js` and runs the planner and model on synthetic data (`demoData()`), plus price parsing on real sample files in `tests/fixtures/` (including the 25-hour DST day). No network needed. New logic goes in `ladeplan.js` (and into its `export` list) unless it needs the DOM, storage or network.
 
 ## Not yet verified
 
