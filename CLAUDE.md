@@ -7,7 +7,7 @@ A personal EV charging planner (VW ID.3, home charger, price area DK1). It answe
 Single static file, `index.html`, no build step and no backend. Everything runs in the browser.
 
 1. **Prices**: day-ahead spot prices from elprisenligenu.dk (`/api/v1/prices/{YYYY}/{MM}-{DD}_{DK1|DK2}.json`, one file per day, free, no key, CORS open). Values are `DKK_per_kWh` excl. VAT; `parsePrices()` converts to DKK/MWh keyed by UTC hour and averages any sub-hourly records. The app fetches 22 past days + today + 2 ahead in parallel. Next-day files appear around 13:00 Danish time; before that they 404, and the 404 is cacheable for 4 h, so future days are fetched with `cache: "no-store"`. Energi Data Service was the original source but returns an empty body without CORS headers to browser requests (verified 2026-10-18), so it can't be called from the page.
-2. **Total price** per kWh = (spot/1000 + supplier markup + grid tariff by hour band + Energinet tariffs + elafgift) × 1.25 VAT. All tariff values are user settings.
+2. **Total price** per kWh = (spot/1000 + supplier markup + grid tariff + Energinet tariffs + elafgift) × 1.25 VAT. All tariff values are user settings. The grid tariff has hour bands (00–06, 06–17, 17–21 peak, 21–24) and two seasons, `t.winter` (Oct–Mar) and `t.summer` (Apr–Sep), picked by each hour's own date in `tariff()`. Old flat `t.night/day/peak` settings are copied to both seasons by `migrateTariffs()`.
 3. **Weather**: Open-Meteo forecast API with `past_days=22`, hourly wind at 100 m, shortwave radiation and temperature at five points (DK west coast, Thy, North Sea, North Germany ×2).
 4. **Forecast model**: recency-weighted ridge regression (half-life 7 days) on ~3 weeks of hourly data. Features: wind power proxy (and its square), solar, temperature, weekend flag, hour-of-day dummies. Refitted on every page load. Used only for hours without published prices, up to the end of the day after tomorrow.
 5. **Planner** (`plan()`): simulates battery kWh hour by hour. Each commute is an event at departure time that must leave `reserve + trip energy` in the battery. For each event in order, it fills the deficit from the cheapest available home slots before departure, respecting the charge limit (falls back to 100% if a trip needs it). Forecast slots are ranked at price + 0.5σ so the plan only waits for a forecast when it is clearly cheaper. Optional "always fill below X kr/kWh" tops up in very cheap hours.
@@ -42,7 +42,7 @@ The test extracts the inline script from `index.html` and runs the planner and m
 - The whole day's trip energy is deducted at departure; the hours containing departure and return are treated as away.
 - If the battery level is entered while the car is away, only half the day's trip is assumed to remain.
 - Trips after the planning horizon (end of the day after tomorrow) are ignored, so the plan can end right at the reserve.
-- Grid tariff bands are fixed (00–06, 06–17, 17–21 peak, 21–24); no seasonal tariff switch, although grid companies charge more Oct–Mar.
+- Grid tariff hour bands and season months (Oct–Mar high) are fixed, not editable.
 - Forecast σ is in-sample on the last 7 days and only grows linearly with lead time; there is no proper backtest.
 - `headroom()` re-simulates the whole timeline for each candidate slot (O(n²)); fine for ~72 slots.
 

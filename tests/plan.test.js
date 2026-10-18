@@ -14,10 +14,10 @@ if (process.env.TZ !== "Europe/Copenhagen") {
 const html = fs.readFileSync(path.join(__dirname, "..", "index.html"), "utf8");
 let js = html.split("<script>")[1].split("</script>")[0];
 globalThis.localStorage = { getItem: () => null, setItem: () => {} };
-js += ";module.exports={demoData,buildHours,plan,drivesFor,consFor,totalPrice,DEF,clone,parsePrices,decide,loadSettings};";
+js += ";module.exports={demoData,buildHours,plan,drivesFor,consFor,totalPrice,DEF,clone,parsePrices,decide,loadSettings,tariff};";
 const mod = { exports: {} };
 new Function("module", js)(mod);
-const { demoData, buildHours, plan, DEF, clone, parsePrices, decide, loadSettings } = mod.exports;
+const { demoData, buildHours, plan, DEF, clone, parsePrices, decide, loadSettings, tariff } = mod.exports;
 const fixture = name => JSON.parse(fs.readFileSync(path.join(__dirname, "fixtures", name), "utf8"));
 
 function run(iso, edit) {
@@ -123,6 +123,39 @@ test("bad stored settings are clamped or reset", () => {
     assert.strictEqual(s.effPct, DEF.effPct);
     assert.strictEqual(s.maxSoc, 100);
     assert.strictEqual(s.cons.w, DEF.cons.w);
+  } finally { globalThis.localStorage.getItem = orig; }
+});
+
+test("grid tariff follows season and hour band", () => {
+  const s = clone(DEF);
+  const at = iso => tariff(new Date(iso).getTime(), s);
+  assert.strictEqual(at("2026-10-01T18:00"), s.t.winter.peak);
+  assert.strictEqual(at("2026-03-31T03:00"), s.t.winter.night);
+  assert.strictEqual(at("2026-04-01T03:00"), s.t.summer.night);
+  assert.strictEqual(at("2026-09-30T22:00"), s.t.summer.day);
+  assert.strictEqual(at("2026-07-14T20:59"), s.t.summer.peak);
+});
+
+test("old flat tariffs migrate to both seasons", () => {
+  const orig = globalThis.localStorage.getItem;
+  globalThis.localStorage.getItem = () => JSON.stringify({ t: { night: 0.11, day: 0.22, peak: 0.66, supplier: 0.02 } });
+  try {
+    const { t } = loadSettings();
+    assert.deepStrictEqual(t.winter, { night: 0.11, day: 0.22, peak: 0.66 });
+    assert.deepStrictEqual(t.summer, { night: 0.11, day: 0.22, peak: 0.66 });
+    assert.strictEqual(t.supplier, 0.02);
+    assert.ok(!("night" in t));
+  } finally { globalThis.localStorage.getItem = orig; }
+});
+
+test("partial seasonal tariffs fill in defaults", () => {
+  const orig = globalThis.localStorage.getItem;
+  globalThis.localStorage.getItem = () => JSON.stringify({ t: { winter: { peak: 0.9 } } });
+  try {
+    const { t } = loadSettings();
+    assert.strictEqual(t.winter.peak, 0.9);
+    assert.strictEqual(t.winter.night, DEF.t.winter.night);
+    assert.deepStrictEqual(t.summer, DEF.t.summer);
   } finally { globalThis.localStorage.getItem = orig; }
 });
 
