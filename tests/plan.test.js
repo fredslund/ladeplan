@@ -159,6 +159,35 @@ test("partial seasonal tariffs fill in defaults", () => {
   } finally { globalThis.localStorage.getItem = orig; }
 });
 
+test("decision levels: needed vs optional vs forecast vs wait", () => {
+  const now = new Date("2026-10-19T09:00"), s = clone(DEF), H = 3600e3;
+  const dep = new Date("2026-10-20T07:30").getTime();
+  const tonight = new Date("2026-10-20T02:00").getTime(), later = new Date("2026-10-21T02:00").getTime();
+  const mk = (start, fc, must) => ({ events: [{ t: dep, check: true, need: 13, lvlAfter: 20, km: 78 }], slots: [], endLvl: 20, B: 58,
+    nextDrive: { t: dep, check: true }, mustKwh: must ? 4 : 0, noChargeLvl: must ? 2 : 30,
+    blocks: [{ start, end: start + 2 * H, kwh: 6, cost: 12, fc }] });
+  const lv = (...a) => { const d = decide(mk(...a), now, s); return [d.cls, d.lvl, d.title]; };
+  assert.deepStrictEqual(lv(tonight, false, true), ["must", "Needed for tomorrow", "Charge tonight"]);
+  assert.deepStrictEqual(lv(tonight, true, true), ["must", "Needed for tomorrow", "Charge tonight"]);
+  assert.deepStrictEqual(lv(later, false, true).slice(0, 2), ["", "Needed before tomorrow"]);
+  assert.deepStrictEqual(lv(tonight, false, false), ["", "Optional · good price", "Charge tonight"]);
+  assert.deepStrictEqual(lv(tonight, true, false), ["fc", "Forecast", "Probably charge tonight"]);
+  assert.deepStrictEqual(lv(later, true, false).slice(0, 2), ["ok", "Not needed tonight"]);
+});
+
+test("planner reports what must be charged before the next drive", () => {
+  const low = run("2026-10-19T21:00", s => { s.soc = 20; });
+  // 20% of 58 = 11.6 kWh; 78 km at 17 kWh/100 km (October = shoulder) = 13.26 kWh; reserve 5.8 -> must 7.46 kWh
+  assert.ok(Math.abs(low.P.mustKwh - 7.46) < 0.01, `mustKwh ${low.P.mustKwh}`);
+  const d = decide(low.P, low.now, low.s);
+  assert.strictEqual(d.cls, "must");
+  const tonightKwh = low.P.blocks.filter(b => b.start < new Date("2026-10-20T07:30").getTime()).reduce((a, b) => a + b.kwh, 0);
+  assert.ok(d.big.includes(`${tonightKwh.toFixed(1)} kWh`), `card shows all of tonight: ${d.big}`);
+  const high = run("2026-10-19T21:00", s => { s.soc = 70; });
+  assert.strictEqual(high.P.mustKwh, 0);
+  assert.notStrictEqual(decide(high.P, high.now, high.s).cls, "must");
+});
+
 test("untouched old default tariffs move to N1 rates, edited ones stay", () => {
   const orig = globalThis.localStorage.getItem;
   const load = t => { globalThis.localStorage.getItem = () => JSON.stringify({ t }); return loadSettings().t; };
