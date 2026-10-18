@@ -35,7 +35,7 @@ The test extracts the inline script from `index.html` and runs the planner and m
 
 - **On the phone.** Deployed to GitHub Pages at https://fredslund.github.io/ladeplan/ (repo `fredslund/ladeplan`, Pages from `main`, root). Live prices and weather verified there from desktop Chrome on 2026-10-18; not yet tested on a phone or as a home-screen app.
 - **elprisenligenu.dk is a third-party hobby service** with no fallback; if it disappears, prices need another browser-callable source.
-- **Default tariffs** are rough estimates, not the owner's actual grid company rates.
+- **Default tariffs**: grid tariffs are N1's C-customer rates valid from 1 Jan 2026 (n1.dk/gaeldende-priser, published in øre incl. VAT, stored as kr excl. VAT). N1's page doesn't state the hour bands or season months; the app assumes the standard Tarifmodel 3.0 ones. Energinet, elafgift and supplier markup defaults are still rough estimates. Update the grid defaults when N1 publishes 2027 prices; add the replaced values to `OLD_GRID_DEFAULTS` so untouched settings follow.
 
 ## Known simplifications worth reviewing
 
