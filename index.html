@@ -45,6 +45,14 @@ h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
 .decision h2{margin:0 0 4px;font-size:21px;text-wrap:balance;line-height:1.25}
 .decision .big{font:500 15px var(--mono);margin:6px 0 2px}
 .decision p{margin:6px 0 0;color:var(--muted)}
+.setup{margin-top:12px;padding:10px 12px;border-radius:8px;background:var(--bg)}
+.setup[hidden]{display:none}
+.setup .label{margin:0 0 6px}
+.setup dl{margin:0;display:flex;flex-wrap:wrap;gap:4px 20px}
+.setup dl div{display:flex;align-items:baseline;gap:8px}
+.setup dt{font-size:13px;color:var(--muted)}
+.setup dd{margin:0;font:600 17px var(--mono);color:var(--ink)}
+.setup .hint{margin:6px 0 0}
 .decision .rate{font-size:13.5px;padding-top:8px;border-top:1px solid var(--line);margin-top:10px}
 .decision .rate:empty{display:none}
 .rate b{font:600 11px var(--sans);text-transform:uppercase;letter-spacing:.06em;margin-right:6px;color:var(--muted)}
@@ -148,6 +156,11 @@ a.inl{color:var(--known)}
     <h2 id="dTitle">Fetching prices…</h2>
     <div class="big" id="dBig"></div>
     <p id="dSub"></p>
+    <div class="setup" id="dSetup" hidden>
+      <p class="label">Set on the car or wallbox</p>
+      <dl><div><dt>Charge limit</dt><dd id="sLimit"></dd></div><div><dt id="sTimerLabel">Timer</dt><dd id="sTimers"></dd></div></dl>
+      <p class="hint" id="sHint"></p>
+    </div>
     <p class="rate" id="dRate"></p>
   </section>
 
@@ -206,12 +219,13 @@ a.inl{color:var(--known)}
       <div class="grid2">
         <label class="field"><span>Usable battery (kWh)</span><input type="number" id="battery" data-k="battery" step="0.5"></label>
         <label class="field"><span>Arrive with at least (%)</span><input type="number" id="reserve" data-k="reserve" step="1"></label>
-        <label class="field"><span>Charge limit (%)</span><input type="number" id="maxSoc" data-k="maxSoc" step="5"></label>
+        <label class="field"><span>Charge limit (%)</span><input type="number" id="maxSoc" data-k="maxSoc" step="10"></label>
         <label class="field"><span>Charger power (kW)</span><input type="number" id="chargerKw" data-k="chargerKw" step="0.5"></label>
         <label class="field"><span>Charging efficiency (%)</span><input type="number" id="effPct" data-k="effPct" step="1"></label>
         <label class="field"><span>Always fill below (kr/kWh)</span><input type="number" id="cheapFill" data-k="cheapFill" step="0.05"></label>
+        <label class="field"><span>One timer window if extra cost under (kr)</span><input type="number" id="oneWindowKr" data-k="oneWindowKr" step="1"></label>
       </div>
-      <p class="note">The charge limit can be exceeded if a long trip needs it. Set "always fill" to 0 to turn it off.</p>
+      <p class="note">The charge limit can be exceeded if a long trip needs it. Set "always fill" to 0 to turn it off. Charging is planned as one timer window per session unless splitting saves more than the amount set.</p>
       <p class="label" style="margin:6px 0 0">Consumption by season, kWh/100 km</p>
       <div class="grid3">
         <label class="field"><span>Summer</span><input type="number" id="c_s" data-k="cons.s" step="0.5"></label>
@@ -263,7 +277,7 @@ a.inl{color:var(--known)}
 <script type="module">
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
-  monIdx, startOfDay, addDays, hhmm, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
+  monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
   buildHours, plan, fmtKr, pct, decide, settingsFrom
 } from "./ladeplan.js";
 
@@ -320,6 +334,14 @@ function renderDecision(P, now){
   rate.className="rate"+(d.rate?" "+d.rate.level:"");
   rate.innerHTML = d.rate ? `<b>${d.rate.tag}</b>` : "";
   if (d.rate) rate.append(d.rate.text);
+  const set=document.getElementById("dSetup");
+  set.hidden=!d.setup;
+  if (d.setup){
+    document.getElementById("sLimit").textContent=`${d.setup.limit}%`;
+    document.getElementById("sTimerLabel").textContent=d.setup.timers.length>1?"Timers":"Timer";
+    document.getElementById("sTimers").textContent=d.setup.timers.join(", ");
+    document.getElementById("sHint").textContent=d.setup.hint;
+  }
 }
 
 let CHART_SEL=null;   // selected hour (ms) in the chart readout; kept across re-renders
@@ -397,7 +419,7 @@ function renderChart(P, now){
 
 function renderTimeline(P, now){
   const items=[];
-  P.blocks.forEach(b=>items.push({t:b.start, html:`<div class="trow chg"><div class="when">${shortDay(b.start,now)} ${hhmm(b.start)}</div><div class="what">Charge until ${hhmm(b.end)}${b.fc?'<span class="pill fc">forecast</span>':''}</div><div class="val">${b.kwh.toFixed(1)} kWh · ${Math.round(b.cost)} kr</div></div>`}));
+  P.blocks.forEach(b=>items.push({t:b.start, html:`<div class="trow chg"><div class="when">${shortDay(b.start,now)} ${hm5(b.start)}</div><div class="what">Charge until ${hm5(b.end,true)} · to ${Math.min(100,Math.ceil(b.lvlEnd/P.B*100-1e-6))}%${b.fc?'<span class="pill fc">forecast</span>':''}</div><div class="val">${b.kwh.toFixed(1)} kWh · ${Math.round(b.cost)} kr</div></div>`}));
   P.events.forEach(e=>items.push({t:e.t, html:`<div class="trow"><div class="when">${shortDay(e.t,now)} ${hhmm(e.t)}</div><div class="what">${e.returning?"Driving home":"Leave"} · ${Math.round(e.km)} km · ${e.need.toFixed(1)} kWh</div><div class="val">${pct(e.lvlBefore,P.B)}% → ${pct(e.lvlAfter,P.B)}%</div></div>`}));
   items.sort((a,b)=>a.t-b.t);
   const tot=P.blocks.reduce((a,b)=>a+b.cost,0), kwh=P.blocks.reduce((a,b)=>a+b.kwh,0);
@@ -522,7 +544,7 @@ async function load(){
   } catch(e){
     DATA=null;
     stamp.textContent="offline";
-    const box=document.getElementById("decision"); box.className="card decision bad"; document.getElementById("dLvl").textContent=""; document.getElementById("dRate").textContent="";
+    const box=document.getElementById("decision"); box.className="card decision bad"; document.getElementById("dLvl").textContent=""; document.getElementById("dRate").textContent=""; document.getElementById("dSetup").hidden=true;
     document.getElementById("dTitle").textContent="Couldn't load prices";
     document.getElementById("dBig").textContent=String(e.message||e);
     document.getElementById("dSub").innerHTML='Check your connection and tap Refresh. The page must be opened from a normal web address. <button class="linkbtn" type="button" id="tryDemo">Show example data</button>';

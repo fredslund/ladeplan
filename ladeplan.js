@@ -6,6 +6,7 @@ const DEF = {
   soc: 50, kmOneWay: 39, depart: "07:30", home: "17:00",
   pattern: [1,1,1,1,0,0,0],           // Mon..Sun, 1 = commute
   battery: 58, reserve: 10, maxSoc: 80, chargerKw: 11, effPct: 90, cheapFill: 0,
+  oneWindowKr: 5,                      // accept up to this many kr extra to charge in one timer window
   cons: { s: 14, h: 17, w: 20 },        // kWh/100 km: summer, shoulder, winter
   seasons: "wwwhhssshhww",             // Jan..Dec
   area: "DK1",
@@ -18,7 +19,7 @@ const DEF = {
 const STORE = "ladeplan.v1";
 // Allowed range per numeric setting; out-of-range values are clamped, non-numbers fall back to the default.
 const LIMITS = {
-  soc:[0,100], kmOneWay:[0,500], battery:[10,200], reserve:[0,50], maxSoc:[50,100], chargerKw:[1,22], effPct:[50,100], cheapFill:[0,5],
+  soc:[0,100], kmOneWay:[0,500], battery:[10,200], reserve:[0,50], maxSoc:[50,100], chargerKw:[1,22], effPct:[50,100], cheapFill:[0,5], oneWindowKr:[0,50],
   "cons.s":[5,50], "cons.h":[5,50], "cons.w":[5,50],
   "t.winter.night":[0,5], "t.winter.day":[0,5], "t.winter.peak":[0,5], "t.summer.night":[0,5], "t.summer.day":[0,5], "t.summer.peak":[0,5], "t.energinet":[0,5], "t.elafgift":[0,5], "t.supplier":[-1,5]
 };
@@ -62,6 +63,10 @@ const monIdx = d => (d.getDay()+6)%7;
 function atTime(day, hhmm){ const [h,m]=hhmm.split(":").map(Number); const d=new Date(day); d.setHours(h,m,0,0); return d; }
 function startOfDay(d){ const x=new Date(d); x.setHours(0,0,0,0); return x; }
 function addDays(d,n){ const x=new Date(d); x.setDate(x.getDate()+n); return x; }
+// Car and wallbox timers take 5-minute steps: starts round down, ends round up, so there's never less charging
+// time than planned. 1 s of slack absorbs float noise from the duration arithmetic.
+const round5 = (t, up) => { const m=5*60e3; return up ? Math.ceil((t-1000)/m)*m : Math.floor((t+1000)/m)*m; };
+const hm5 = (t, up) => hhmm(round5(t, up));
 const hhmm = t => { const d=new Date(t); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 function dayLabel(t, now){
   const d0=startOfDay(now).getTime(), d=startOfDay(new Date(t)).getTime();
@@ -240,17 +245,58 @@ function plan(hours, s, now){
       if (amt>0.01) slots[i].charge+=amt;
     }
   }
-  const {before, endLvl}=sim();
-  events.forEach((e,k)=>{ e.lvlBefore=before[k]; e.lvlAfter=before[k]-e.need; });
-  // contiguous charging blocks
-  const blocks=[]; let cur=null;
-  slots.forEach(sl=>{
-    if (sl.charge>0.01){
+  // Prices are fixed per hour, so only the energy in each hour matters. In each run of consecutive charging
+  // hours, move charge so at most one hour is partly used and it sits at one end of the run (whichever is
+  // cheaper, and only if that doesn't cost more). The run then maps to one unbroken timer window.
+  for (const sl of slots) if (sl.charge<=0.01) sl.charge=0;
+  const runs=[]; let run=null;
+  slots.forEach((sl,i)=>{ if (sl.charge>0){ if (run && run[run.length-1]===i-1) run.push(i); else runs.push(run=[i]); } else run=null; });
+  for (const r of runs){
+    if (r.length<2) continue;
+    const E=r.reduce((a,i)=>a+slots[i].charge,0), cost=m=>r.reduce((a,i)=>a+m(i)*slots[i].price,0);
+    const fill=idx=>{ let left=E; const m=new Map(); for (const i of idx){ const v=Math.min(slots[i].capK,left); m.set(i,v); left-=v; } return i=>m.get(i); };
+    const now_=i=>slots[i].charge, fwd=fill(r), back=fill([...r].reverse());
+    const best=[fwd,back].reduce((x,y)=>cost(y)<cost(x)-1e-9?y:x);
+    if (cost(best)<=cost(now_)+1e-9) for (const i of r) slots[i].charge=best(i)>0.01?best(i):0;
+  }
+  // Charging windows with exact times. A partly used hour charges at its end when the next hour also charges
+  // (so the window is unbroken), otherwise at its start.
+  const windows=()=>{
+    const out=[]; let cur=null;
+    slots.forEach((sl,i)=>{
+      if (!(sl.charge>0)){ cur=null; return; }
+      const a=Math.max(sl.t,nowMs), b=sl.t+H, dur=sl.charge/(s.chargerKw*eff)*H;
+      const prev=i>0 && slots[i-1].charge>0, next=i+1<slots.length && slots[i+1].charge>0;
+      const [x,y] = dur>=b-a-1000 ? [a,b] : (!prev && next) ? [b-dur,b] : [a,a+dur];
       const grid=sl.charge/eff, cost=grid*sl.price;
-      if (cur && sl.t===cur.end){ cur.end=sl.t+H; cur.kwh+=grid; cur.cost+=cost; cur.fc=cur.fc||sl.fc; }
-      else { cur={start:Math.max(sl.t,nowMs), end:sl.t+H, kwh:grid, cost, fc:sl.fc}; blocks.push(cur); }
-    } else cur=null;
-  });
+      if (cur && Math.abs(cur.end-x)<1000){ cur.end=y; cur.kwh+=grid; cur.cost+=cost; cur.fc=cur.fc||sl.fc; cur.idx.push(i); }
+      else { cur={start:x, end:y, kwh:grid, cost, fc:sl.fc, idx:[i]}; out.push(cur); }
+    });
+    return out;
+  };
+  // One timer window is easier to set up: merge neighbouring windows when the car is home in between and the
+  // cheaper of front- or back-filling the span costs less than s.oneWindowKr more.
+  const MERGE_KR=s.oneWindowKr;
+  for (let guard=0; guard<50; guard++){
+    const w=windows(); let merged=false;
+    for (let k=1;k<w.length && !merged;k++){
+      const span=[]; for (let i=w[k-1].idx[0]; i<=w[k].idx[w[k].idx.length-1]; i++) span.push(i);
+      if (span.some(i=>!slots[i].home)) continue;
+      const E=span.reduce((x,i)=>x+slots[i].charge,0), cur=span.reduce((x,i)=>x+slots[i].charge*slots[i].price,0);
+      let best=null;
+      for (const list of [span, [...span].reverse()]){
+        let left=E, c=0; const m=new Map();
+        for (const i of list){ const v=Math.min(slots[i].capK,left); m.set(i,v); c+=v*slots[i].price; left-=v; }
+        if (left<=0.01 && (!best || c<best.c)) best={c,m};
+      }
+      if (best && (best.c-cur)/eff < MERGE_KR){ for (const i of span) slots[i].charge=best.m.get(i)>0.01?best.m.get(i):0; merged=true; }
+    }
+    if (!merged) break;
+  }
+  const {before, endLvl, after}=sim();
+  slots.forEach((sl,i)=>{ sl.lvl=after[i]; });
+  events.forEach((e,k)=>{ e.lvlBefore=before[k]; e.lvlAfter=before[k]-e.need; });
+  const blocks=windows().map(w=>({ start:w.start, end:w.end, kwh:w.kwh, cost:w.cost, fc:w.fc, lvlEnd:slots[w.idx[w.idx.length-1]].lvl, hours:w.idx.length }));
   return { slots, events, blocks, endLvl, B, nextDrive, mustKwh, noChargeLvl, res };
 }
 
@@ -283,6 +329,30 @@ function priceRating(x, days){
   return { level: f>=0.7 ? "cheap" : f<=0.3 ? "pricey" : "typical", beat, n, lo:days[0], hi:days[n-1] };
 }
 
+// Best single timer window covering the same battery energy as `sess` (several windows), for cars or wallboxes
+// that take only one. Fills the span's home hours from the start or from the end, whichever is cheaper.
+// Returns { start, end, extra } (extra kr vs. the planned windows) or null if the car is away in between.
+function oneWindow(P, sess, s, now){
+  const eff=s.effPct/100, kw=s.chargerKw*eff, nowMs=now.getTime();
+  const a=sess[0].start, b=sess[sess.length-1].end;
+  const span=P.slots.filter(sl=>sl.t+H>a && sl.t<b);
+  if (!span.length || span.some(sl=>!sl.home)) return null;
+  const E=sess.reduce((x,w)=>x+w.kwh*eff,0), planned=sess.reduce((x,w)=>x+w.cost,0);
+  const fill=list=>{
+    let left=E, cost=0; const used=[];
+    for (const sl of list){ const v=Math.min(sl.capK,left); if (v>0){ used.push([sl,v]); cost+=v/eff*sl.price; left-=v; } }
+    return left>0.01 ? null : { used, cost };
+  };
+  const opts=[];
+  const f=fill(span);
+  if (f){ const [sl,v]=f.used[f.used.length-1]; opts.push({ start:Math.max(span[0].t,nowMs), end:Math.max(sl.t,nowMs)+v/kw*H, cost:f.cost }); }
+  const r=fill([...span].reverse());
+  if (r){ const [sl,v]=r.used[r.used.length-1]; opts.push({ start:sl.t+H-v/kw*H, end:span[span.length-1].t+H, cost:r.cost }); }
+  if (!opts.length) return null;
+  const best=opts.reduce((x,y)=>y.cost<x.cost?y:x);
+  return { start:best.start, end:best.end, extra:Math.max(0,best.cost-planned) };
+}
+
 // Decision card, pure so it can be tested. Two questions decide the level:
 // is charging needed before the next drive (else it's just price-driven), and is the price known or forecast.
 // "Now" means the time until the car next leaves, which can include midday on WFH days and weekends.
@@ -297,7 +367,7 @@ function decide(P, now, s, prices){
     if (t<=now.getTime()+H) return "now";
     const h=new Date(t).getHours(), d=dayLabel(t,now);
     if ((d==="Today" && (h>=18 || h<6)) || (d==="Tomorrow" && h<6)) return "tonight";
-    return `${day(t)} ${hhmm(t)}`;
+    return `${day(t)} ${hm5(t)}`;
   };
   if (short) return { cls:"bad", lvl:"Not enough",
     title:`Not enough time to charge for ${day(short.t)}`,
@@ -315,31 +385,53 @@ function decide(P, now, s, prices){
   const home=first.start<leaveAt;
   const sess=home ? before.filter(b=>b.start<first.start+18*H) : [first], lastW=sess[sess.length-1];
   const kwh=sess.reduce((a,b)=>a+b.kwh,0), cost=sess.reduce((a,b)=>a+b.cost,0), fc=sess.some(b=>b.fc);
-  const label=`${dayLabel(first.start,now)} ${hhmm(first.start)}–${hhmm(lastW.end)}`;
+  const label=`${dayLabel(first.start,now)} ${hm5(first.start)}–${hm5(lastW.end,true)}`;
   const avg=fmtKr(cost/kwh);
   const fcNote=" Hours are based on forecast prices; check again after 13:00.";
   const windows=(sess.length>1 ? ` Split into ${sess.length} windows, see the plan below.` : "")
     + (before.length>sess.length ? ` ${before.length-sess.length} more before you leave ${day(leaveAt)} ${hhmm(leaveAt)}.` : "");
   const must=(P.mustKwh||0)>0.05 && nextDrive;
   // Compare this session's average with the same number of cheapest home hours on recent days.
-  const k=Math.max(1, Math.round(sess.reduce((a,b)=>a+(b.end-b.start),0)/H));
+  const k=Math.max(1, sess.reduce((a,b)=>a+(b.hours||Math.round((b.end-b.start)/H)),0));
   const r = home && prices ? priceRating(cost/kwh, recentDays(prices, s, now, k)) : null;
   const rate = r && { level:r.level, tag:{cheap:"Cheap", typical:"Typical", pricey:"Pricey"}[r.level],
     text:`${fc?"Expected ":""}${avg} kr/kWh beats ${r.beat} of the last ${r.n} days (cheapest ${k} home hour${k>1?"s":""} each: ${fmtKr(r.lo)}–${fmtKr(r.hi)} kr/kWh).` };
   const big=`${label} · ${kwh.toFixed(1)} kWh · ≈ ${Math.round(cost)} kr${fc?" (forecast)":""}`;
+  // What to set on the car or wallbox: a charge limit (battery % at the end of the session) and timer windows.
+  let setup=null;
+  if (home && lastW.lvlEnd!=null){
+    // The car takes limits in 10% steps from 50%; round up so the limit never stops charging early.
+    // The timer then sets the amount and the limit is a safety stop.
+    const planned=lastW.lvlEnd/P.B*100, limit=Math.min(100, Math.max(50, Math.ceil(planned/10-1e-6)*10));
+    const timers=sess.map(b=>`${b.start<=now.getTime()+60e3?"now":hm5(b.start)}–${hm5(b.end,true)}`);
+    let hint;
+    if (sess.length>1){
+      const one=oneWindow(P, sess, s, now);
+      hint=`Set ${sess.length} timer windows; the limit alone would also charge in between.`
+        + (one ? ` If only one window is possible, use ${one.start<=now.getTime()+60e3?"now":hm5(one.start)}–${hm5(one.end,true)} (≈ ${fmtKr(one.extra)} kr more).` : "");
+    }
+    else {
+      const h=Math.ceil(lastW.end/H)*H, exact=limit-planned<1;
+      // Prices are per hour: if the limit matches the plan, running on to the end of the hour costs the same
+      hint = !exact ? `The timer sets the amount (to about ${Math.round(planned)}%); the ${limit}% limit is just a safety stop.`
+        : h-lastW.end>60e3 ? `With the limit set, the timer can run until ${hhmm(h)}; prices are per hour, so it costs the same.`
+        : "The limit stops charging at the right level; the timer keeps it in the cheap hours.";
+    }
+    setup={ limit, timers, hint };
+  }
   if (must && home){
     const p=pct(P.noChargeLvl,P.B), needGrid=P.mustKwh/(s.effPct/100), planned=before.reduce((a,b)=>a+b.kwh,0);
     const without = p<=0 ? `Without charging you'd run out before getting home from ${day(nextDrive.t)}'s drive.`
       : `Without charging you'd get home from ${day(nextDrive.t)}'s drive with ${p}%, below your ${s.reserve}% reserve.`;
     const extra = planned-needGrid>1 ? ` At least ${needGrid.toFixed(1)} kWh is needed; the rest is cheaper before you leave than after.` : "";
-    return { cls:"must", lvl:`Needed for ${day(nextDrive.t)}`, title:`Charge ${when(first.start)}`, big, rate,
+    return { cls:"must", lvl:`Needed for ${day(nextDrive.t)}`, title:`Charge ${when(first.start)}`, big, rate, setup,
       sub: without + extra + windows + (fc ? fcNote : ` Average ${avg} kr/kWh.`) };
   }
   if (home && !fc) return { cls:"", lvl: rate && rate.level==="cheap" ? "Optional · good price" : "Optional · cheapest ahead",
-    title:`Charge ${when(first.start)}`, big, rate,
+    title:`Charge ${when(first.start)}`, big, rate, setup,
     sub: (nextDrive ? `Not needed for ${day(nextDrive.t)} yet, but this is the cheapest time in the plan.` : "Below your always-fill price.")
       + ` Average ${avg} kr/kWh.` + windows };
-  if (home) return { cls:"fc", lvl:"Forecast", title:`Probably charge ${when(first.start)}`, big, rate,
+  if (home) return { cls:"fc", lvl:"Forecast", title:`Probably charge ${when(first.start)}`, big, rate, setup,
     sub:`Not needed yet, but this looks like the cheapest time. Expected ≈ ${avg} kr/kWh.` + windows + fcNote };
   return { cls:"ok", lvl:"Not needed yet",
     title:"No need to charge before you leave",
@@ -350,7 +442,7 @@ function decide(P, now, s, prices){
 
 export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
-  pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, dayLabel,
-  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, recentDays, priceRating, kmOn,
+  pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
+  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, priceRating, kmOn,
   buildHours, drivesFor, plan, fmtKr, pct, decide
 };
