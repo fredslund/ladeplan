@@ -188,5 +188,34 @@ test("planner reports what must be charged before the next drive", () => {
   assert.notStrictEqual(decide(high.P, high.now, high.s).cls, "must");
 });
 
+test("untouched old default tariffs move to N1 rates, edited ones stay", () => {
+  const orig = globalThis.localStorage.getItem;
+  const load = t => { globalThis.localStorage.getItem = () => JSON.stringify({ t }); return loadSettings().t; };
+  try {
+    // flat pre-seasonal default, copied to both seasons, then replaced
+    let t = load({ night: 0.15, day: 0.30, peak: 0.70 });
+    assert.deepStrictEqual(t.winter, DEF.t.winter);
+    assert.deepStrictEqual(t.summer, DEF.t.summer);
+    // seasonal old defaults
+    t = load({ winter: { night: 0.15, day: 0.30, peak: 0.70 }, summer: { night: 0.10, day: 0.15, peak: 0.35 } });
+    assert.deepStrictEqual(t.winter, DEF.t.winter);
+    assert.deepStrictEqual(t.summer, DEF.t.summer);
+    // one field edited: keep that season as is
+    t = load({ winter: { night: 0.15, day: 0.30, peak: 0.71 }, summer: { night: 0.10, day: 0.15, peak: 0.35 } });
+    assert.deepStrictEqual(t.winter, { night: 0.15, day: 0.30, peak: 0.71 });
+    assert.deepStrictEqual(t.summer, DEF.t.summer);
+  } finally { globalThis.localStorage.getItem = orig; }
+});
+
+test("N1 defaults give the published price incl. VAT", () => {
+  const s = clone(DEF);
+  const gridInclVat = iso => Math.round(tariff(new Date(iso).getTime(), s) * 1.25 * 10000) / 100;   // øre
+  assert.strictEqual(gridInclVat("2026-01-15T18:00"), 98.84);
+  assert.strictEqual(gridInclVat("2026-01-15T10:00"), 32.95);
+  assert.strictEqual(gridInclVat("2026-07-15T18:00"), 42.83);
+  assert.strictEqual(gridInclVat("2026-07-15T10:00"), 16.47);
+  assert.strictEqual(gridInclVat("2026-07-15T03:00"), 10.98);
+});
+
 console.log(failed ? `\n${failed} failed` : "\nall passed");
 process.exit(failed ? 1 : 0);

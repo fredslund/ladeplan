@@ -183,18 +183,18 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
   <details>
     <summary>Tariffs &amp; taxes</summary>
     <div class="panel">
-      <p class="note">Kr/kWh excluding VAT. Defaults are rough estimates; copy the real numbers from your electricity bill or your grid company's website.</p>
+      <p class="note">Kr/kWh excluding VAT. Grid tariff defaults are N1's 2026 rates; the other defaults are rough estimates. Check your electricity bill for the real numbers.</p>
       <p class="label" style="margin:6px 0 0">Grid tariff, Oct–Mar (high season)</p>
       <div class="grid3">
-        <label class="field"><span>00–06</span><input type="number" id="tw_night" data-k="t.winter.night" step="0.01"></label>
-        <label class="field"><span>06–17, 21–24</span><input type="number" id="tw_day" data-k="t.winter.day" step="0.01"></label>
-        <label class="field"><span>17–21 peak</span><input type="number" id="tw_peak" data-k="t.winter.peak" step="0.01"></label>
+        <label class="field"><span>00–06</span><input type="number" id="tw_night" data-k="t.winter.night" step="0.00001"></label>
+        <label class="field"><span>06–17, 21–24</span><input type="number" id="tw_day" data-k="t.winter.day" step="0.00001"></label>
+        <label class="field"><span>17–21 peak</span><input type="number" id="tw_peak" data-k="t.winter.peak" step="0.00001"></label>
       </div>
       <p class="label" style="margin:6px 0 0">Grid tariff, Apr–Sep (low season)</p>
       <div class="grid3">
-        <label class="field"><span>00–06</span><input type="number" id="ts_night" data-k="t.summer.night" step="0.01"></label>
-        <label class="field"><span>06–17, 21–24</span><input type="number" id="ts_day" data-k="t.summer.day" step="0.01"></label>
-        <label class="field"><span>17–21 peak</span><input type="number" id="ts_peak" data-k="t.summer.peak" step="0.01"></label>
+        <label class="field"><span>00–06</span><input type="number" id="ts_night" data-k="t.summer.night" step="0.00001"></label>
+        <label class="field"><span>06–17, 21–24</span><input type="number" id="ts_day" data-k="t.summer.day" step="0.00001"></label>
+        <label class="field"><span>17–21 peak</span><input type="number" id="ts_peak" data-k="t.summer.peak" step="0.00001"></label>
       </div>
       <p class="label" style="margin:6px 0 0">Other</p>
       <div class="grid2">
@@ -231,8 +231,9 @@ const DEF = {
   cons: { s: 14, h: 17, w: 20 },        // kWh/100 km: summer, shoulder, winter
   seasons: "wwwhhssshhww",             // Jan..Dec
   area: "DK1",
-  t: { winter: { night: 0.15, day: 0.30, peak: 0.70 },   // grid tariff Oct–Mar
-       summer: { night: 0.10, day: 0.15, peak: 0.35 },   // grid tariff Apr–Sep
+  // Grid tariff: N1 C-customer rates from 1 Jan 2026 (n1.dk), converted from øre incl. VAT to kr excl. VAT
+  t: { winter: { night: 0.08784, day: 0.2636, peak: 0.79072 },   // Oct–Mar: 10.98 / 32.95 / 98.84 øre incl. VAT
+       summer: { night: 0.08784, day: 0.13176, peak: 0.34264 },  // Apr–Sep: 10.98 / 16.47 / 42.83 øre incl. VAT
        energinet: 0.14, elafgift: 0.008, supplier: 0.05 },
   overrides: {}                        // "YYYY-MM-DD" -> round-trip km
 };
@@ -250,6 +251,8 @@ function clampSetting(k, v){
   const [lo,hi]=LIMITS[k];
   return typeof v==="number" && isFinite(v) ? Math.min(hi, Math.max(lo, v)) : getPath(DEF,k);
 }
+// Earlier default grid tariffs (rough estimates); a season still set to one of these was never edited.
+const OLD_GRID_DEFAULTS = [{ night: 0.15, day: 0.30, peak: 0.70 }, { night: 0.10, day: 0.15, peak: 0.35 }];
 // Before seasonal tariffs, t had flat night/day/peak; keep them for both seasons so nothing changes.
 function migrateTariffs(t){
   if (t.night!=null || t.day!=null || t.peak!=null){
@@ -258,6 +261,10 @@ function migrateTariffs(t){
     delete t.night; delete t.day; delete t.peak;
   }
   t.winter=Object.assign(clone(DEF.t.winter), t.winter); t.summer=Object.assign(clone(DEF.t.summer), t.summer);
+  for (const k of ["winter","summer"]){
+    const g=t[k];
+    if (OLD_GRID_DEFAULTS.some(o=>o.night===g.night && o.day===g.day && o.peak===g.peak)) t[k]=clone(DEF.t[k]);
+  }
   return t;
 }
 function loadSettings(){
