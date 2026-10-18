@@ -33,7 +33,7 @@ The test extracts the inline script from `index.html` and runs the planner and m
 
 ## Not yet verified
 
-- **Hosted deployment.** Both live fetches were verified from Chrome on `localhost` (2026-10-18), not yet from GitHub Pages or on the phone.
+- **On the phone.** Deployed to GitHub Pages at https://fredslund.github.io/ladeplan/ (repo `fredslund/ladeplan`, Pages from `main`, root). Live prices and weather verified there from desktop Chrome on 2026-10-18; not yet tested on a phone or as a home-screen app.
 - **elprisenligenu.dk is a third-party hobby service** with no fallback; if it disappears, prices need another browser-callable source.
 - **Default tariffs** are rough estimates, not the owner's actual grid company rates.
 
