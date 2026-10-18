@@ -85,11 +85,13 @@ details[open] summary::after{content:"–"}
 .grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px}
 .field{display:flex;flex-direction:column;gap:3px;min-width:0}
 .field span{font-size:12.5px;color:var(--muted)}
-input[type=number],input[type=time],select{font:15px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;width:100%}
+/* 16px minimum: iOS Safari zooms in on focus for smaller text in form fields */
+input[type=number],input[type=time],select{font:16px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;width:100%}
 input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--charge);outline-offset:2px}
-.week{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
-.daybtn{font:500 12.5px var(--sans);border:1px solid var(--line);background:var(--bg);color:var(--muted);border-radius:6px;padding:7px 0;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:1px}
-.daybtn b{color:var(--ink);font-weight:600}
+/* minmax(0,1fr): columns may shrink below their text, so seven days fit a 320px phone */
+.week{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
+.daybtn{font:500 11px var(--sans);border:1px solid var(--line);background:var(--bg);color:var(--muted);border-radius:6px;padding:6px 0;min-height:44px;min-width:0;cursor:pointer;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px}
+.daybtn b{color:var(--ink);font-weight:600;font-size:13px}
 .daybtn[aria-pressed=true]{background:var(--known);border-color:var(--known);color:#fff}
 .daybtn[aria-pressed=true] b{color:#fff}
 .grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
@@ -178,7 +180,7 @@ a.inl{color:var(--known)}
   <details>
     <summary>Weekly pattern</summary>
     <div class="panel">
-      <p class="note">Tap a day to switch between commute and home (WFH or no driving). Distance and times are in <a href="#settings" class="inl">Settings</a>.</p>
+      <p class="note">Tap a day to switch between work (commute) and home (WFH or no driving). Distance and times are in <a href="#settings" class="inl">Settings</a>.</p>
       <div class="week" id="week"></div>
     </div>
   </details>
@@ -425,11 +427,20 @@ function renderTrips(now){
 
 function renderWeek(){
   const box=document.getElementById("week"); box.innerHTML="";
-  ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].forEach((n,i)=>{
+  const full=["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+  full.forEach((name,i)=>{
     const b=document.createElement("button"); b.type="button"; b.className="daybtn";
-    b.setAttribute("aria-pressed", S.pattern[i]?"true":"false");
-    b.innerHTML=`<b>${n}</b>${S.pattern[i]?"Commute":"Home"}`;
-    b.addEventListener("click",()=>{ S.pattern[i]=S.pattern[i]?0:1; saveSettings(); renderWeek(); renderTrips(new Date()); recompute(); });
+    const day=document.createElement("b"), state=document.createElement("span");
+    day.textContent=name.slice(0,3); b.append(day, state);
+    const paint=()=>{
+      const on=!!S.pattern[i];
+      b.setAttribute("aria-pressed", on?"true":"false");
+      b.setAttribute("aria-label", `${name}: ${on?"commute":"home"}`);
+      state.textContent=on?"Work":"Home";
+    };
+    paint();
+    // Update in place so keyboard focus stays on the button
+    b.addEventListener("click",()=>{ S.pattern[i]=S.pattern[i]?0:1; saveSettings(); paint(); renderTrips(new Date()); recompute(); });
     box.appendChild(b);
   });
 }
