@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, totalPrice, recentNights, priceRating, startOfDay, addDays, atTime } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -150,7 +150,7 @@ test("decision levels: needed vs optional vs forecast vs wait", () => {
   assert.deepStrictEqual(lv(tonight, false, true), ["must", "Needed for tomorrow", "Charge tonight"]);
   assert.deepStrictEqual(lv(tonight, true, true), ["must", "Needed for tomorrow", "Charge tonight"]);
   assert.deepStrictEqual(lv(later, false, true).slice(0, 2), ["", "Needed before tomorrow"]);
-  assert.deepStrictEqual(lv(tonight, false, false), ["", "Optional · good price", "Charge tonight"]);
+  assert.deepStrictEqual(lv(tonight, false, false), ["", "Optional · cheapest ahead", "Charge tonight"]);   // no history: no rating
   assert.deepStrictEqual(lv(tonight, true, false), ["fc", "Forecast", "Probably charge tonight"]);
   assert.deepStrictEqual(lv(later, true, false).slice(0, 2), ["ok", "Not needed tonight"]);
 });
@@ -192,6 +192,55 @@ test("N1 defaults give the published price incl. VAT", () => {
   assert.strictEqual(gridInclVat("2026-07-15T18:00"), 42.83);
   assert.strictEqual(gridInclVat("2026-07-15T10:00"), 16.47);
   assert.strictEqual(gridInclVat("2026-07-15T03:00"), 10.98);
+});
+
+// Past nights i=1..7 before `now`: spot 1000+100*i inside each home→departure window, 0 outside it
+function nightHistory(now, s) {
+  const prices = new Map(), H = 3600e3, today = startOfDay(now);
+  for (let t = addDays(today, -9).getTime(); t < now.getTime(); t += H) prices.set(t, 0);
+  for (let i = 1; i <= 7; i++) {
+    const a = atTime(addDays(today, -i), s.home).getTime(), b = atTime(addDays(today, -i + 1), s.depart).getTime();
+    for (let t = a; t + H <= b; t += H) prices.set(t, 1000 + 100 * i);
+  }
+  return prices;
+}
+
+test("recent nights use only home→departure hours, cheapest k per night", () => {
+  const now = new Date("2026-10-19T21:00"), s = clone(DEF);
+  const nights = recentNights(nightHistory(now, s), s, now, 2);
+  assert.strictEqual(nights.length, 7);
+  // cheapest hours in each window fall in the 00–06 band; the zero-priced daytime hours are ignored
+  const at3 = i => totalPrice(1000 + 100 * i, new Date("2026-10-15T03:00").getTime(), s);
+  nights.forEach((v, j) => assert.ok(Math.abs(v - at3(j + 1)) < 1e-9, `night ${j}: ${v} vs ${at3(j + 1)}`));
+  // before departure, last night isn't over yet and is left out
+  assert.strictEqual(recentNights(nightHistory(now, s), s, new Date("2026-10-19T06:00"), 2).length, 6);
+});
+
+test("price rating thresholds", () => {
+  const n = [1, 2, 3, 4, 5, 6, 7];
+  assert.strictEqual(priceRating(0.5, n).level, "cheap");
+  assert.strictEqual(priceRating(2.5, n).level, "cheap");     // beats 5/7
+  assert.strictEqual(priceRating(3.5, n).level, "typical");   // beats 4/7
+  assert.strictEqual(priceRating(5.5, n).level, "pricey");    // beats 2/7
+  assert.strictEqual(priceRating(1, [1, 2]), null);           // too little history
+});
+
+test("decision card rates tonight against recent nights", () => {
+  const now = new Date("2026-10-19T21:00"), s = clone(DEF), H = 3600e3;
+  const prices = nightHistory(now, s);
+  const start = new Date("2026-10-20T02:00").getTime();
+  const card = spot => {
+    const price = totalPrice(spot, start, s);
+    const P = { events: [], slots: [], endLvl: 30, B: 58, mustKwh: 0, nextDrive: { t: new Date("2026-10-20T07:30").getTime(), check: true },
+      blocks: [{ start, end: start + 2 * H, kwh: 10, cost: 10 * price, fc: false }] };
+    return decide(P, now, s, prices);
+  };
+  const cheap = card(1050), pricey = card(1750);
+  assert.strictEqual(cheap.rate.level, "cheap");
+  assert.strictEqual(cheap.lvl, "Optional · good price");
+  assert.ok(cheap.rate.text.includes("beats 7 of the last 7 nights") && cheap.rate.text.includes("cheapest 2 h"), cheap.rate.text);
+  assert.strictEqual(pricey.rate.level, "pricey");
+  assert.strictEqual(pricey.lvl, "Optional · cheapest ahead");
 });
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
