@@ -176,16 +176,26 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
     <summary>Tariffs &amp; taxes</summary>
     <div class="panel">
       <p class="note">Kr/kWh excluding VAT. Defaults are rough estimates; copy the real numbers from your electricity bill or your grid company's website.</p>
+      <p class="label" style="margin:6px 0 0">Grid tariff, Oct–Mar (high season)</p>
+      <div class="grid3">
+        <label class="field"><span>00–06</span><input type="number" id="tw_night" data-k="t.winter.night" step="0.01"></label>
+        <label class="field"><span>06–17, 21–24</span><input type="number" id="tw_day" data-k="t.winter.day" step="0.01"></label>
+        <label class="field"><span>17–21 peak</span><input type="number" id="tw_peak" data-k="t.winter.peak" step="0.01"></label>
+      </div>
+      <p class="label" style="margin:6px 0 0">Grid tariff, Apr–Sep (low season)</p>
+      <div class="grid3">
+        <label class="field"><span>00–06</span><input type="number" id="ts_night" data-k="t.summer.night" step="0.01"></label>
+        <label class="field"><span>06–17, 21–24</span><input type="number" id="ts_day" data-k="t.summer.day" step="0.01"></label>
+        <label class="field"><span>17–21 peak</span><input type="number" id="ts_peak" data-k="t.summer.peak" step="0.01"></label>
+      </div>
+      <p class="label" style="margin:6px 0 0">Other</p>
       <div class="grid2">
-        <label class="field"><span>Grid tariff 00–06</span><input type="number" id="t_night" data-k="t.night" step="0.01"></label>
-        <label class="field"><span>Grid tariff 06–17, 21–24</span><input type="number" id="t_day" data-k="t.day" step="0.01"></label>
-        <label class="field"><span>Grid tariff 17–21 (peak)</span><input type="number" id="t_peak" data-k="t.peak" step="0.01"></label>
         <label class="field"><span>Energinet tariffs</span><input type="number" id="t_energinet" data-k="t.energinet" step="0.01"></label>
         <label class="field"><span>Elafgift</span><input type="number" id="t_elafgift" data-k="t.elafgift" step="0.001"></label>
         <label class="field"><span>Supplier markup</span><input type="number" id="t_supplier" data-k="t.supplier" step="0.01"></label>
         <label class="field"><span>Price area</span><select id="area" data-k="area"><option>DK1</option><option>DK2</option></select></label>
       </div>
-      <p class="note">Elafgift is temporarily cut to near zero in 2026–2027. Grid tariffs usually rise in winter (October–March).</p>
+      <p class="note">Each hour uses the grid tariff for its own date. <span id="tariffNow"></span> Elafgift is temporarily cut to near zero in 2026–2027.</p>
     </div>
   </details>
 
@@ -213,7 +223,9 @@ const DEF = {
   cons: { s: 14, h: 17, w: 20 },        // kWh/100 km: summer, shoulder, winter
   seasons: "wwwhhssshhww",             // Jan..Dec
   area: "DK1",
-  t: { night: 0.15, day: 0.30, peak: 0.70, energinet: 0.14, elafgift: 0.008, supplier: 0.05 },
+  t: { winter: { night: 0.15, day: 0.30, peak: 0.70 },   // grid tariff Oct–Mar
+       summer: { night: 0.10, day: 0.15, peak: 0.35 },   // grid tariff Apr–Sep
+       energinet: 0.14, elafgift: 0.008, supplier: 0.05 },
   overrides: {}                        // "YYYY-MM-DD" -> round-trip km
 };
 const STORE = "ladeplan.v1";
@@ -221,7 +233,7 @@ const STORE = "ladeplan.v1";
 const LIMITS = {
   soc:[0,100], kmOneWay:[0,500], battery:[10,200], reserve:[0,50], maxSoc:[50,100], chargerKw:[1,22], effPct:[50,100], cheapFill:[0,5],
   "cons.s":[5,50], "cons.h":[5,50], "cons.w":[5,50],
-  "t.night":[0,5], "t.day":[0,5], "t.peak":[0,5], "t.energinet":[0,5], "t.elafgift":[0,5], "t.supplier":[-1,5]
+  "t.winter.night":[0,5], "t.winter.day":[0,5], "t.winter.peak":[0,5], "t.summer.night":[0,5], "t.summer.day":[0,5], "t.summer.peak":[0,5], "t.energinet":[0,5], "t.elafgift":[0,5], "t.supplier":[-1,5]
 };
 function clone(o){ return JSON.parse(JSON.stringify(o)); }
 function getPath(o,p){ return p.split(".").reduce((a,k)=>a[k], o); }
@@ -230,9 +242,19 @@ function clampSetting(k, v){
   const [lo,hi]=LIMITS[k];
   return typeof v==="number" && isFinite(v) ? Math.min(hi, Math.max(lo, v)) : getPath(DEF,k);
 }
+// Before seasonal tariffs, t had flat night/day/peak; keep them for both seasons so nothing changes.
+function migrateTariffs(t){
+  if (t.night!=null || t.day!=null || t.peak!=null){
+    const flat={ night:t.night, day:t.day, peak:t.peak };
+    t.winter=Object.assign({}, t.winter, flat); t.summer=Object.assign({}, t.summer, flat);
+    delete t.night; delete t.day; delete t.peak;
+  }
+  t.winter=Object.assign(clone(DEF.t.winter), t.winter); t.summer=Object.assign(clone(DEF.t.summer), t.summer);
+  return t;
+}
 function loadSettings(){
   let s = clone(DEF);
-  try { const raw = localStorage.getItem(STORE); if (raw){ const p = JSON.parse(raw); s = Object.assign(s, p); s.t = Object.assign(clone(DEF.t), p.t || {}); s.cons = Object.assign(clone(DEF.cons), p.cons || {}); delete s.kwhPer100; if (!/^[shw]{12}$/.test(s.seasons)) s.seasons = DEF.seasons; } } catch(e){}
+  try { const raw = localStorage.getItem(STORE); if (raw){ const p = JSON.parse(raw); s = Object.assign(s, p); s.t = migrateTariffs(Object.assign(clone(DEF.t), p.t || {})); s.cons = Object.assign(clone(DEF.cons), p.cons || {}); delete s.kwhPer100; if (!/^[shw]{12}$/.test(s.seasons)) s.seasons = DEF.seasons; } } catch(e){}
   for (const k in LIMITS) setPath(s, k, clampSetting(k, getPath(s,k)));
   return s;
 }
@@ -259,7 +281,11 @@ const SEASON = { s:"Summer", h:"Shoulder", w:"Winter" };
 const consFor = (day, s) => s.cons[s.seasons[new Date(day).getMonth()]];
 
 /* ---------- prices ---------- */
-function tariff(t, s){ const h=new Date(t).getHours(); return h<6 ? s.t.night : (h>=17 && h<21) ? s.t.peak : s.t.day; }
+const isTariffWinter = t => { const m=new Date(t).getMonth(); return m>=9 || m<=2; };   // Oct–Mar
+function tariff(t, s){
+  const d=new Date(t), h=d.getHours(), g=isTariffWinter(t) ? s.t.winter : s.t.summer;
+  return h<6 ? g.night : (h>=17 && h<21) ? g.peak : g.day;
+}
 function totalPrice(spotMWh, t, s){ return (spotMWh/1000 + s.t.supplier + tariff(t,s) + s.t.energinet + s.t.elafgift) * 1.25; }
 
 /* ---------- forecast model ---------- */
@@ -661,6 +687,7 @@ async function load(){
 if (typeof document!=="undefined" && document.getElementById("decision")){
   // drop overrides older than today
   const today=dateKey(new Date()); for (const k of Object.keys(S.overrides)) if (k<today) delete S.overrides[k];
+  document.getElementById("tariffNow").textContent=`Now: ${isTariffWinter(Date.now())?"high":"low"} season.`;
   bindInputs(); renderWeek(); renderMonths(); renderTrips(new Date()); load();
   document.addEventListener("visibilitychange",()=>{ if (document.visibilityState==="visible") load(); });
 }
