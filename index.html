@@ -106,6 +106,16 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
 .linkbtn{background:none;border:0;color:var(--known);font:500 13px var(--sans);cursor:pointer;padding:4px}
 .btn{font:600 14px var(--sans);background:var(--known);color:#fff;border:0;border-radius:8px;padding:10px 14px;cursor:pointer}
 .btn.ghost{background:transparent;color:var(--known);border:1px solid var(--line)}
+.view{display:flex;flex-direction:column;gap:16px}
+.view[hidden]{display:none}
+.hright{display:flex;align-items:center;gap:10px}
+.iconbtn{display:inline-flex;align-items:center;justify-content:center;width:40px;height:40px;margin:-8px -8px -8px 0;border-radius:8px;color:var(--muted)}
+.iconbtn:hover{color:var(--ink);background:var(--away)}
+.iconbtn:focus-visible,a.btn:focus-visible,a.inl:focus-visible{outline:2px solid var(--charge);outline-offset:2px}
+a.btn{text-decoration:none;display:inline-block}
+a.inl{color:var(--known)}
+.set{display:flex;flex-direction:column;gap:12px}
+.set .sh{font-size:16px;margin:0}
 .err{color:var(--warn)}
 .note{font-size:12.5px;color:var(--muted)}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
@@ -114,9 +124,15 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
 </head>
 <body>
 <div class="wrap">
+<div class="view" id="mainView">
   <header>
     <h1>Ladeplan <small>ID.3 · DK1</small></h1>
-    <span class="stamp" id="stamp">loading prices…</span>
+    <div class="hright">
+      <span class="stamp" id="stamp">loading prices…</span>
+      <a href="#settings" class="iconbtn" id="openSettings" aria-label="Settings" title="Settings">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
+      </a>
+    </div>
   </header>
 
   <section class="card soc">
@@ -162,19 +178,29 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
   <details>
     <summary>Weekly pattern</summary>
     <div class="panel">
-      <p class="note">Tap a day to switch between commute and home (WFH or no driving).</p>
+      <p class="note">Tap a day to switch between commute and home (WFH or no driving). Distance and times are in <a href="#settings" class="inl">Settings</a>.</p>
       <div class="week" id="week"></div>
+    </div>
+  </details>
+</div>
+
+<div class="view" id="settingsView" hidden>
+  <header>
+    <h1 id="settingsTitle" tabindex="-1">Settings</h1>
+    <a href="#" class="btn ghost" id="closeSettings">Done</a>
+  </header>
+  <p class="note">These rarely change. Everything is saved on this device as you edit.</p>
+  <section class="card set">
+    <h2 class="sh">Commute</h2>
       <div class="grid2">
         <label class="field"><span>Commute, one way (km)</span><input type="number" id="kmOneWay" data-k="kmOneWay" step="1" min="0"></label>
         <label class="field"><span>Leave home</span><input type="time" id="depart" data-k="depart"></label>
         <label class="field"><span>Back home</span><input type="time" id="home" data-k="home"></label>
       </div>
-    </div>
-  </details>
-
-  <details>
-    <summary>Car &amp; charging</summary>
-    <div class="panel">
+      <p class="note">Which days you commute is set in the weekly pattern on the main page.</p>
+  </section>
+  <section class="card set">
+    <h2 class="sh">Car &amp; charging</h2>
       <div class="grid2">
         <label class="field"><span>Usable battery (kWh)</span><input type="number" id="battery" data-k="battery" step="0.5"></label>
         <label class="field"><span>Arrive with at least (%)</span><input type="number" id="reserve" data-k="reserve" step="1"></label>
@@ -192,12 +218,10 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
       </div>
       <p class="note">Tap a month to change its season. Each trip uses the value for its own date. <span id="consNow"></span></p>
       <div class="months" id="months"></div>
-    </div>
-  </details>
-
-  <details>
-    <summary>Tariffs &amp; taxes</summary>
-    <div class="panel">
+    
+  </section>
+  <section class="card set">
+    <h2 class="sh">Tariffs &amp; taxes</h2>
       <p class="note">Kr/kWh excluding VAT. Grid tariff defaults are N1's 2026 rates; the other defaults are rough estimates. Check your electricity bill for the real numbers.</p>
       <p class="label" style="margin:6px 0 0">Grid tariff, Oct–Mar (high season)</p>
       <div class="grid3">
@@ -219,20 +243,19 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
         <label class="field"><span>Price area</span><select id="area" data-k="area"><option>DK1</option><option>DK2</option></select></label>
       </div>
       <p class="note">Each hour uses the grid tariff for its own date. <span id="tariffNow"></span> Elafgift is temporarily cut to near zero in 2026–2027.</p>
-    </div>
-  </details>
-
-  <details>
-    <summary>About the forecast</summary>
-    <div class="panel">
+    
+  </section>
+  <section class="card set">
+    <h2 class="sh">Data &amp; forecast</h2>
       <p class="note" id="modelInfo">The forecast fits a simple model on the last three weeks: price against wind and solar forecasts for West Denmark and North Germany, temperature, hour of day and weekend. It is refitted every time you open the page.</p>
       <div class="row">
         <button class="btn ghost" id="reload" type="button">Refresh data</button>
         <button class="btn ghost" id="demo" type="button">Show example data</button>
       </div>
       <p class="note">Data: Elprisen lige nu (Energi Data Service), Open-Meteo. Settings are stored on this device only.</p>
-    </div>
-  </details>
+    
+  </section>
+</div>
 </div>
 
 <script type="module">
@@ -499,6 +522,27 @@ async function load(){
 if (typeof document!=="undefined" && document.getElementById("decision")){
   // drop overrides older than today
   const today=dateKey(new Date()); for (const k of Object.keys(S.overrides)) if (k<today) delete S.overrides[k];
+  // Settings live on their own page at #settings, so the back gesture closes it
+  const views=()=>{
+    const set=location.hash==="#settings";
+    document.getElementById("mainView").hidden=set;
+    document.getElementById("settingsView").hidden=!set;
+    window.scrollTo(0,0);
+    if (set) document.getElementById("settingsTitle").focus({preventScroll:true});
+  };
+  const onNav=()=>{ views(); if (location.hash!=="#settings") document.getElementById("openSettings").focus({preventScroll:true}); };
+  window.addEventListener("hashchange", onNav);
+  window.addEventListener("popstate", onNav);
+  document.getElementById("closeSettings").addEventListener("click", e=>{
+    e.preventDefault();
+    // Go back if we came from the main page, so Done and the back gesture behave the same
+    if (history.state && history.state.fromMain) history.back();
+    else { history.replaceState(null, "", location.pathname+location.search); onNav(); }
+  });
+  for (const a of document.querySelectorAll('a[href="#settings"]')) a.addEventListener("click", e=>{
+    e.preventDefault(); history.pushState({fromMain:true}, "", "#settings"); views();
+  });
+  views();
   document.getElementById("tariffNow").textContent=`Now: ${isTariffWinter(Date.now())?"high":"low"} season.`;
   bindInputs(); renderWeek(); renderMonths(); renderTrips(new Date()); load();
   document.addEventListener("visibilitychange",()=>{ if (document.visibilityState==="visible") load(); });
