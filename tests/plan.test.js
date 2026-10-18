@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, recentDays, priceRating, kmOn, startOfDay, addDays, atTime } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -157,20 +157,61 @@ test("partial seasonal tariffs fill in defaults", () => {
   assert.deepStrictEqual(t.summer, DEF.t.summer);
 });
 
-test("decision levels: needed vs optional vs forecast vs wait", () => {
+test("decision levels: needed vs optional vs forecast vs nothing before you leave", () => {
   const now = new Date("2026-10-19T09:00"), s = clone(DEF), H = 3600e3;
   const dep = new Date("2026-10-20T07:30").getTime();
-  const tonight = new Date("2026-10-20T02:00").getTime(), later = new Date("2026-10-21T02:00").getTime();
+  const tonight = new Date("2026-10-20T02:00").getTime(), afterDrive = new Date("2026-10-21T02:00").getTime();
   const mk = (start, fc, must) => ({ events: [{ t: dep, check: true, need: 13, lvlAfter: 20, km: 78 }], slots: [], endLvl: 20, B: 58,
     nextDrive: { t: dep, check: true }, mustKwh: must ? 4 : 0, noChargeLvl: must ? 2 : 30,
     blocks: [{ start, end: start + 2 * H, kwh: 6, cost: 12, fc }] });
   const lv = (...a) => { const d = decide(mk(...a), now, s); return [d.cls, d.lvl, d.title]; };
   assert.deepStrictEqual(lv(tonight, false, true), ["must", "Needed for tomorrow", "Charge tonight"]);
   assert.deepStrictEqual(lv(tonight, true, true), ["must", "Needed for tomorrow", "Charge tonight"]);
-  assert.deepStrictEqual(lv(later, false, true).slice(0, 2), ["", "Needed before tomorrow"]);
-  assert.deepStrictEqual(lv(tonight, false, false), ["", "Optional · good price", "Charge tonight"]);
+  assert.deepStrictEqual(lv(tonight, false, false), ["", "Optional · cheapest ahead", "Charge tonight"]);   // no history: no rating
   assert.deepStrictEqual(lv(tonight, true, false), ["fc", "Forecast", "Probably charge tonight"]);
-  assert.deepStrictEqual(lv(later, true, false).slice(0, 2), ["ok", "Not needed tonight"]);
+  assert.deepStrictEqual(lv(afterDrive, true, false), ["ok", "Not needed yet", "No need to charge before you leave"]);
+});
+
+test("charge title names the actual time, including days ahead before the next drive", () => {
+  const H = 3600e3, s = clone(DEF);
+  const card = (nowIso, startIso, depIso, must) => {
+    const now = new Date(nowIso), start = new Date(startIso).getTime(), dep = new Date(depIso).getTime();
+    return decide({ events: [{ t: dep, check: true, need: 13, lvlAfter: 20 }], slots: [], endLvl: 20, B: 58,
+      nextDrive: { t: dep, check: true }, mustKwh: must ? 4 : 0, noChargeLvl: 2,
+      blocks: [{ start, end: start + 2 * H, kwh: 6, cost: 12, fc: false }] }, now, s);
+  };
+  // Thursday evening, Friday is WFH: midday tomorrow
+  assert.strictEqual(card("2026-10-22T20:00", "2026-10-23T11:00", "2026-10-26T07:30", true).title, "Charge tomorrow 11:00");
+  // Friday morning, next drive Monday: a cheap Sunday midday is still before you leave
+  const sun = card("2026-10-23T08:00", "2026-10-25T12:00", "2026-10-26T07:30", true);
+  assert.deepStrictEqual([sun.cls, sun.lvl, sun.title], ["must", "Needed for Mon", "Charge Sun 12:00"]);
+  assert.strictEqual(card("2026-10-19T09:00", "2026-10-19T09:30", "2026-10-20T07:30", false).title, "Charge now");
+  assert.strictEqual(card("2026-10-19T09:00", "2026-10-19T13:00", "2026-10-20T07:30", false).title, "Charge today 13:00");
+  assert.strictEqual(card("2026-10-19T09:00", "2026-10-19T22:00", "2026-10-20T07:30", false).title, "Charge tonight");
+});
+
+test("planner uses midday on a WFH day and nights on a commute day", () => {
+  const plan1 = (iso, edit) => {
+    const now = new Date(iso), s = clone(DEF); s.soc = 15; edit(s);
+    const d = demoData(now);
+    // make 10:00–15:00 clearly the cheapest part of every day
+    for (const [t, v] of d.prices) { const h = new Date(t).getHours(); if (h >= 10 && h < 15) d.prices.set(t, v - 600); }
+    for (const [t, w] of d.weather) { const h = new Date(t).getHours(); if (h >= 10 && h < 15) w.solar = 1; }
+    const { hours } = buildHours(d.prices, d.weather, s, now);
+    return { P: plan(hours, s, now), now, s };
+  };
+  // Thursday evening; Friday is WFH by default, trip on Saturday
+  const wfh = plan1("2026-10-22T20:00", s => { s.overrides = { "2026-10-24": 150 }; });
+  assert.ok(wfh.P.blocks.length > 0);
+  for (const b of wfh.P.blocks) {
+    const d = new Date(b.start);
+    assert.ok(d.getDay() === 5 && d.getHours() >= 10 && d.getHours() < 15, `WFH charge at ${d}`);
+  }
+  assert.strictEqual(decide(wfh.P, wfh.now, wfh.s).title, `Charge tomorrow ${String(new Date(wfh.P.blocks[0].start).getHours()).padStart(2, "0")}:00`);
+  // Monday evening, Tuesday commute: car is away at midday, so it charges overnight
+  const commute = plan1("2026-10-19T20:00", () => {});
+  for (const b of commute.P.blocks) assert.ok(new Date(b.start).getHours() < 7, `commute-day charge at ${new Date(b.start)}`);
+  assert.strictEqual(decide(commute.P, commute.now, commute.s).title, "Charge tonight");
 });
 
 test("planner reports what must be charged before the next drive", () => {
@@ -210,6 +251,60 @@ test("N1 defaults give the published price incl. VAT", () => {
   assert.strictEqual(gridInclVat("2026-07-15T18:00"), 42.83);
   assert.strictEqual(gridInclVat("2026-07-15T10:00"), 16.47);
   assert.strictEqual(gridInclVat("2026-07-15T03:00"), 10.98);
+});
+
+// Past days i=1..7 before `now`: spot 1000+100*i, 0 while the car is away on driving days (must be ignored),
+// and a 600 DKK/MWh dip at 11–13 on days the car is home all day.
+function dayHistory(now, s) {
+  const prices = new Map(), H = 3600e3, today = startOfDay(now);
+  for (let i = 1; i <= 7; i++) {
+    const day = addDays(today, -i), km = kmOn(day, s), base = 1000 + 100 * i;
+    const dep = atTime(day, s.depart).getTime(), back = atTime(day, s.home).getTime();
+    for (let t = day.getTime(); t < addDays(day, 1).getTime(); t += H) {
+      const h = new Date(t).getHours();
+      prices.set(t, km > 0 && t < back && t + H > dep ? 0 : km === 0 && (h === 11 || h === 12) ? base - 600 : base);
+    }
+  }
+  return prices;
+}
+
+test("recent days use home hours only, including midday on WFH days and weekends", () => {
+  const now = new Date("2026-10-19T21:00"), s = clone(DEF);   // Mon; Fri 16, Sat 17, Sun 18 are home days
+  const at = (spot, iso) => totalPrice(spot, new Date(iso).getTime(), s);
+  const expected = [1, 2, 3, 4, 5, 6, 7].map(i => {
+    const day = addDays(startOfDay(now), -i);
+    return kmOn(day, s) > 0 ? at(1000 + 100 * i, "2026-10-15T03:00") : at(1000 + 100 * i - 600, "2026-10-15T12:00");
+  }).sort((a, b) => a - b);
+  const days = recentDays(dayHistory(now, s), s, now, 2);
+  assert.strictEqual(days.length, 7);
+  days.forEach((v, j) => assert.ok(Math.abs(v - expected[j]) < 1e-9, `day ${j}: ${v} vs ${expected[j]}`));
+});
+
+test("price rating thresholds", () => {
+  const n = [1, 2, 3, 4, 5, 6, 7];
+  assert.strictEqual(priceRating(0.5, n).level, "cheap");
+  assert.strictEqual(priceRating(2.5, n).level, "cheap");     // beats 5/7
+  assert.strictEqual(priceRating(3.5, n).level, "typical");   // beats 4/7
+  assert.strictEqual(priceRating(5.5, n).level, "pricey");    // beats 2/7
+  assert.strictEqual(priceRating(1, [1, 2]), null);           // too little history
+});
+
+test("decision card rates the window against recent days", () => {
+  const now = new Date("2026-10-19T21:00"), s = clone(DEF), H = 3600e3;
+  const prices = dayHistory(now, s);
+  const start = new Date("2026-10-20T02:00").getTime();
+  const card = spot => {
+    const price = totalPrice(spot, start, s);
+    const P = { events: [], slots: [], endLvl: 30, B: 58, mustKwh: 0, nextDrive: { t: new Date("2026-10-20T07:30").getTime(), check: true },
+      blocks: [{ start, end: start + 2 * H, kwh: 10, cost: 10 * price, fc: false }] };
+    return decide(P, now, s, prices);
+  };
+  const cheap = card(300), pricey = card(1750);
+  assert.strictEqual(cheap.rate.level, "cheap");
+  assert.strictEqual(cheap.lvl, "Optional · good price");
+  assert.ok(cheap.rate.text.includes("beats 7 of the last 7 days") && cheap.rate.text.includes("cheapest 2 home hours"), cheap.rate.text);
+  assert.strictEqual(pricey.rate.level, "pricey");
+  assert.strictEqual(pricey.lvl, "Optional · cheapest ahead");
 });
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");

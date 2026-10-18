@@ -45,6 +45,11 @@ h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
 .decision h2{margin:0 0 4px;font-size:21px;text-wrap:balance;line-height:1.25}
 .decision .big{font:500 15px var(--mono);margin:6px 0 2px}
 .decision p{margin:6px 0 0;color:var(--muted)}
+.decision .rate{font-size:13.5px;padding-top:8px;border-top:1px solid var(--line);margin-top:10px}
+.decision .rate:empty{display:none}
+.rate b{font:600 11px var(--sans);text-transform:uppercase;letter-spacing:.06em;margin-right:6px;color:var(--muted)}
+.rate.cheap b{color:var(--good)}
+.rate.pricey b{color:var(--warn)}
 .soc{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px}
 .soc label{font-weight:600}
 .soc output{font:500 22px var(--mono);min-width:3.5ch;text-align:right}
@@ -125,6 +130,7 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
     <h2 id="dTitle">Fetching prices…</h2>
     <div class="big" id="dBig"></div>
     <p id="dSub"></p>
+    <p class="rate" id="dRate"></p>
   </section>
 
   <section class="card">
@@ -279,12 +285,16 @@ const S = loadSettings();
 let DATA=null, MODEL=null, DEMO=false;
 
 function renderDecision(P, now){
-  const d=decide(P, now, S);
+  const d=decide(P, now, S, DATA && DATA.prices);
   document.getElementById("decision").className="card decision"+(d.cls?" "+d.cls:"");
   document.getElementById("dLvl").textContent=d.lvl;
   document.getElementById("dTitle").textContent=d.title;
   document.getElementById("dBig").textContent=d.big;
   document.getElementById("dSub").textContent=d.sub;
+  const rate=document.getElementById("dRate");
+  rate.className="rate"+(d.rate?" "+d.rate.level:"");
+  rate.innerHTML = d.rate ? `<b>${d.rate.tag}</b>` : "";
+  if (d.rate) rate.append(d.rate.text);
 }
 
 let CHART_SEL=null;   // selected hour (ms) in the chart readout; kept across re-renders
@@ -478,7 +488,7 @@ async function load(){
   } catch(e){
     DATA=null;
     stamp.textContent="offline";
-    const box=document.getElementById("decision"); box.className="card decision bad"; document.getElementById("dLvl").textContent="";
+    const box=document.getElementById("decision"); box.className="card decision bad"; document.getElementById("dLvl").textContent=""; document.getElementById("dRate").textContent="";
     document.getElementById("dTitle").textContent="Couldn't load prices";
     document.getElementById("dBig").textContent=String(e.message||e);
     document.getElementById("dSub").innerHTML='Check your connection and tap Refresh. The page must be opened from a normal web address. <button class="linkbtn" type="button" id="tryDemo">Show example data</button>';

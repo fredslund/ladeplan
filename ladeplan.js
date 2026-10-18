@@ -174,12 +174,15 @@ function buildHours(prices, weather, s, now){
   return { hours, model };
 }
 
+// Round-trip km on a date: per-date override, else the weekly pattern (0 = car home all day)
+function kmOn(day, s){ const key=dateKey(day); return s.overrides[key]!=null ? s.overrides[key] : (s.pattern[monIdx(day)] ? 2*s.kmOneWay : 0); }
+
 function drivesFor(s, now, horizonEnd){
   const ev=[];
   const need = (km, day) => km*consFor(day, s)/100;
   for (let i=0;i<4;i++){
     const day=addDays(startOfDay(now),i), key=dateKey(day);
-    const km = s.overrides[key]!=null ? s.overrides[key] : (s.pattern[monIdx(day)] ? 2*s.kmOneWay : 0);
+    const km=kmOn(day, s);
     if (km<=0) continue;
     const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
     if (dep>=horizonEnd) continue;
@@ -255,15 +258,47 @@ function plan(hours, s, now){
 const fmtKr = v => v.toFixed(2).replace(".",",");
 const pct = (kwh,B) => Math.round(kwh/B*100);
 
+// Price check: for each of the last `days` full days, the average of its cheapest k hours while the car was
+// home (whole day on WFH days and weekends, outside departure–return on driving days), at today's tariffs.
+// Tells whether a window is actually cheap or just the least bad option ahead.
+function recentDays(prices, s, now, k, days=7){
+  const out=[], today=startOfDay(now);
+  for (let i=1;i<=days;i++){
+    const day=addDays(today,-i), next=addDays(day,1).getTime(), km=kmOn(day,s);
+    const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
+    const ps=[];
+    for (let t=day.getTime(); t<next; t+=H){
+      if (km>0 && t<back && t+H>dep) continue;   // away, same rule as plan()
+      const sp=prices.get(t); if (sp!=null) ps.push(totalPrice(sp,t,s));
+    }
+    if (ps.length<k) continue;
+    ps.sort((a,b)=>a-b); out.push(ps.slice(0,k).reduce((a,b)=>a+b,0)/k);
+  }
+  return out.sort((a,b)=>a-b);
+}
+// Rank price x against recent days: "cheap" if it beats at least 70% of them, "pricey" if at most 30%.
+function priceRating(x, days){
+  const n=days.length; if (n<3) return null;
+  const beat=days.filter(v=>v>x).length, f=beat/n;
+  return { level: f>=0.7 ? "cheap" : f<=0.3 ? "pricey" : "typical", beat, n, lo:days[0], hi:days[n-1] };
+}
+
 // Decision card, pure so it can be tested. Two questions decide the level:
 // is charging needed before the next drive (else it's just price-driven), and is the price known or forecast.
-// cls: "bad" | "must" | "" (optional, known price) | "fc" (optional, forecast) | "ok" (no charging tonight)
-function decide(P, now, s){
+// "Now" means the time until the car next leaves, which can include midday on WFH days and weekends.
+// cls: "bad" | "must" | "" (optional, known price) | "fc" (optional, forecast) | "ok" (nothing before you leave)
+function decide(P, now, s, prices){
   const short=P.events.find(e=>e.short>0);
   const first=P.blocks[0];
-  const tonightEnd=atTime(addDays(startOfDay(now),1),s.depart).getTime();
   const nextDrive=P.nextDrive || P.events.find(e=>e.check);
   const day = t => { const l=dayLabel(t,now); return l==="Today"||l==="Tomorrow" ? l.toLowerCase() : l; };
+  // "now", "tonight" (18:00–06:00 ahead), else "today 11:00", "tomorrow 11:00", "Sat 12:00"
+  const when = t => {
+    if (t<=now.getTime()+H) return "now";
+    const h=new Date(t).getHours(), d=dayLabel(t,now);
+    if ((d==="Today" && (h>=18 || h<6)) || (d==="Tomorrow" && h<6)) return "tonight";
+    return `${day(t)} ${hhmm(t)}`;
+  };
   if (short) return { cls:"bad", lvl:"Not enough",
     title:`Not enough time to charge for ${day(short.t)}`,
     big:`${short.need.toFixed(1)} kWh needed · ${short.short.toFixed(1)} kWh short`,
@@ -274,45 +309,48 @@ function decide(P, now, s){
       big:`Battery ends around ${pct(P.endLvl,P.B)}% on ${DOW[new Date(last).getDay()]}`,
       sub:"Your commute is covered with your reserve intact for the days shown." };
   }
-  // Summarise all charging before tomorrow's departure, not just the first window.
-  const tonight=first.start<tonightEnd;
-  const win=tonight ? P.blocks.filter(b=>b.start<tonightEnd) : [first], lastW=win[win.length-1];
-  const kwh=win.reduce((a,b)=>a+b.kwh,0), cost=win.reduce((a,b)=>a+b.cost,0), fc=win.some(b=>b.fc);
+  // Charging you can do before the car next leaves; the card summarises the first session (windows within 18 h).
+  const leaveAt=nextDrive ? nextDrive.t : Infinity;
+  const before=P.blocks.filter(b=>b.start<leaveAt);
+  const home=first.start<leaveAt;
+  const sess=home ? before.filter(b=>b.start<first.start+18*H) : [first], lastW=sess[sess.length-1];
+  const kwh=sess.reduce((a,b)=>a+b.kwh,0), cost=sess.reduce((a,b)=>a+b.cost,0), fc=sess.some(b=>b.fc);
   const label=`${dayLabel(first.start,now)} ${hhmm(first.start)}–${hhmm(lastW.end)}`;
   const avg=fmtKr(cost/kwh);
   const fcNote=" Hours are based on forecast prices; check again after 13:00.";
-  const windows = win.length>1 ? ` Split into ${win.length} windows, see the plan below.` : "";
+  const windows=(sess.length>1 ? ` Split into ${sess.length} windows, see the plan below.` : "")
+    + (before.length>sess.length ? ` ${before.length-sess.length} more before you leave ${day(leaveAt)} ${hhmm(leaveAt)}.` : "");
   const must=(P.mustKwh||0)>0.05 && nextDrive;
-  const hrs=new Date(first.start).getHours();
-  const verb = first.start<=now.getTime()+H ? "Charge now" : (hrs>=18 || hrs<9 || dayLabel(first.start,now)!=="Today") ? "Charge tonight" : "Charge today";
+  // Compare this session's average with the same number of cheapest home hours on recent days.
+  const k=Math.max(1, Math.round(sess.reduce((a,b)=>a+(b.end-b.start),0)/H));
+  const r = home && prices ? priceRating(cost/kwh, recentDays(prices, s, now, k)) : null;
+  const rate = r && { level:r.level, tag:{cheap:"Cheap", typical:"Typical", pricey:"Pricey"}[r.level],
+    text:`${fc?"Expected ":""}${avg} kr/kWh beats ${r.beat} of the last ${r.n} days (cheapest ${k} home hour${k>1?"s":""} each: ${fmtKr(r.lo)}–${fmtKr(r.hi)} kr/kWh).` };
   const big=`${label} · ${kwh.toFixed(1)} kWh · ≈ ${Math.round(cost)} kr${fc?" (forecast)":""}`;
-  if (must){
-    const p=pct(P.noChargeLvl,P.B), needGrid=P.mustKwh/(s.effPct/100);
+  if (must && home){
+    const p=pct(P.noChargeLvl,P.B), needGrid=P.mustKwh/(s.effPct/100), planned=before.reduce((a,b)=>a+b.kwh,0);
     const without = p<=0 ? `Without charging you'd run out before getting home from ${day(nextDrive.t)}'s drive.`
       : `Without charging you'd get home from ${day(nextDrive.t)}'s drive with ${p}%, below your ${s.reserve}% reserve.`;
-    const extra = tonight && kwh-needGrid>1 ? ` At least ${needGrid.toFixed(1)} kWh is needed; the rest is cheaper now than later.` : "";
-    if (tonight) return { cls:"must", lvl:`Needed for ${day(nextDrive.t)}`, title:verb, big,
+    const extra = planned-needGrid>1 ? ` At least ${needGrid.toFixed(1)} kWh is needed; the rest is cheaper before you leave than after.` : "";
+    return { cls:"must", lvl:`Needed for ${day(nextDrive.t)}`, title:`Charge ${when(first.start)}`, big, rate,
       sub: without + extra + windows + (fc ? fcNote : ` Average ${avg} kr/kWh.`) };
-    return { cls:"", lvl:`Needed before ${day(nextDrive.t)}`,
-      title:`Wait, charge ${dayLabel(first.start,now).toLowerCase()} ${hhmm(first.start)}`, big,
-      sub:`You need ${needGrid.toFixed(1)} kWh before ${day(nextDrive.t)} ${hhmm(nextDrive.t)}, but it's cheaper later than tonight.` + (fc ? fcNote : "") };
   }
-  if (tonight && !fc) return { cls:"", lvl:"Optional · good price", title:verb, big,
+  if (home && !fc) return { cls:"", lvl: rate && rate.level==="cheap" ? "Optional · good price" : "Optional · cheapest ahead",
+    title:`Charge ${when(first.start)}`, big, rate,
     sub: (nextDrive ? `Not needed for ${day(nextDrive.t)} yet, but this is the cheapest time in the plan.` : "Below your always-fill price.")
       + ` Average ${avg} kr/kWh.` + windows };
-  if (tonight) return { cls:"fc", lvl:"Forecast", title:"Probably charge tonight", big,
-    sub:`Not needed yet, but tonight looks cheapest. Expected ≈ ${avg} kr/kWh.` + fcNote };
-  return { cls:"ok", lvl:"Not needed tonight",
-    title:"Wait, no need to charge tonight",
+  if (home) return { cls:"fc", lvl:"Forecast", title:`Probably charge ${when(first.start)}`, big, rate,
+    sub:`Not needed yet, but this looks like the cheapest time. Expected ≈ ${avg} kr/kWh.` + windows + fcNote };
+  return { cls:"ok", lvl:"Not needed yet",
+    title:"No need to charge before you leave",
     big:`Next: ${label} · ${first.kwh.toFixed(1)} kWh${first.fc?" (forecast)":""}`,
-    sub: first.fc
-      ? `Expected ≈ ${avg} kr/kWh. ${nextDrive?`You still reach home from ${day(nextDrive.t)}'s commute with ${pct(nextDrive.lvlAfter,P.B)}%. `:""}Check again after 13:00 when tomorrow's prices are published.`
-      : `Known price ≈ ${avg} kr/kWh.` };
+    sub: (nextDrive ? `You get home from ${day(nextDrive.t)}'s drive with ${pct(nextDrive.lvlAfter,P.B)}%. ` : "")
+      + (first.fc ? `Expected ≈ ${avg} kr/kWh. Check again after 13:00 when tomorrow's prices are published.` : `Known price ≈ ${avg} kr/kWh.`) };
 }
 
 export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, dayLabel,
-  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData,
+  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, recentDays, priceRating, kmOn,
   buildHours, drivesFor, plan, fmtKr, pct, decide
 };
