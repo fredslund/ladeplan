@@ -1,0 +1,54 @@
+# Ladeplan
+
+A personal EV charging planner (VW ID.3, home charger, price area DK1). It answers one question each day: should we charge tonight, and when, or is it cheaper to wait?
+
+## How it works
+
+Single static file, `index.html`, no build step and no backend. Everything runs in the browser.
+
+1. **Prices**: day-ahead spot prices from elprisenligenu.dk (`/api/v1/prices/{YYYY}/{MM}-{DD}_{DK1|DK2}.json`, one file per day, free, no key, CORS open). Values are `DKK_per_kWh` excl. VAT; `parsePrices()` converts to DKK/MWh keyed by UTC hour and averages any sub-hourly records. The app fetches 22 past days + today + 2 ahead in parallel. Next-day files appear around 13:00 Danish time; before that they 404, and the 404 is cacheable for 4 h, so future days are fetched with `cache: "no-store"`. Energi Data Service was the original source but returns an empty body without CORS headers to browser requests (verified 2026-10-18), so it can't be called from the page.
+2. **Total price** per kWh = (spot/1000 + supplier markup + grid tariff by hour band + Energinet tariffs + elafgift) × 1.25 VAT. All tariff values are user settings.
+3. **Weather**: Open-Meteo forecast API with `past_days=22`, hourly wind at 100 m, shortwave radiation and temperature at five points (DK west coast, Thy, North Sea, North Germany ×2).
+4. **Forecast model**: recency-weighted ridge regression (half-life 7 days) on ~3 weeks of hourly data. Features: wind power proxy (and its square), solar, temperature, weekend flag, hour-of-day dummies. Refitted on every page load. Used only for hours without published prices, up to the end of the day after tomorrow.
+5. **Planner** (`plan()`): simulates battery kWh hour by hour. Each commute is an event at departure time that must leave `reserve + trip energy` in the battery. For each event in order, it fills the deficit from the cheapest available home slots before departure, respecting the charge limit (falls back to 100% if a trip needs it). Forecast slots are ranked at price + 0.5σ so the plan only waits for a forecast when it is clearly cheaper. Optional "always fill below X kr/kWh" tops up in very cheap hours.
+6. **Consumption**: seasonal kWh/100 km (summer/shoulder/winter) with a user-editable month-to-season map; each trip uses the value for its date.
+7. **Settings**: `localStorage` key `ladeplan.v1`, per device only. Older keys are migrated in `loadSettings()`. Numeric settings are clamped to `LIMITS` on load and on edit; an emptied field keeps its previous value.
+8. **Degraded mode**: if Open-Meteo fails, the app still plans on known prices (no forecast hours) and the stamp says "no forecast".
+
+## Owner's preferences and constraints
+
+- Commute 39 km each way, usually one WFH day per week (configurable weekly pattern plus per-date km overrides).
+- Must arrive home with at least 10% battery.
+- 58 kWh usable battery, 11 kW AC charging.
+- Intended deployment: GitHub Pages, added to the phone home screen. Keep it a single self-contained file unless there's a strong reason not to.
+- UI copy is English; keep it plain and short. Mobile first (~390 px wide), light and dark themes via CSS tokens on `:root`.
+
+## Tests
+
+```
+TZ=Europe/Copenhagen node tests/plan.test.js
+```
+
+The test extracts the inline script from `index.html` and runs the planner and model on synthetic data (`demoData()`), plus price parsing on real sample files in `tests/fixtures/` (including the 25-hour DST day). No network needed. Keep pure logic free of DOM access so it stays testable this way.
+
+## Not yet verified
+
+- **Hosted deployment.** Both live fetches were verified from Chrome on `localhost` (2026-10-18), not yet from GitHub Pages or on the phone.
+- **elprisenligenu.dk is a third-party hobby service** with no fallback; if it disappears, prices need another browser-callable source.
+- **Default tariffs** are rough estimates, not the owner's actual grid company rates.
+
+## Known simplifications worth reviewing
+
+- The whole day's trip energy is deducted at departure; the hours containing departure and return are treated as away.
+- If the battery level is entered while the car is away, only half the day's trip is assumed to remain.
+- Trips after the planning horizon (end of the day after tomorrow) are ignored, so the plan can end right at the reserve.
+- Grid tariff bands are fixed (00–06, 06–17, 17–21 peak, 21–24); no seasonal tariff switch, although grid companies charge more Oct–Mar.
+- Forecast σ is in-sample on the last 7 days and only grows linearly with lead time; there is no proper backtest.
+- `headroom()` re-simulates the whole timeline for each candidate slot (O(n²)); fine for ~72 slots.
+
+## Ideas on the list
+
+- Consumption driven by forecast temperature on each drive day instead of fixed seasons.
+- Export/import of settings as a short code, to move them between phones.
+- A backtest view: how good were the forecasts and how much did the plan save vs. charging at 17:00.
+- Optional direct charger or car control if an API is available.

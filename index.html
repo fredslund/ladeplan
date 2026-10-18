@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#14212b">
+<title>Ladeplan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: one narrow column, decision card first, then chart, then settings in collapsible panels */
+:root{
+  --bg:#f1f4f6; --surface:#ffffff; --ink:#14212b; --muted:#5b6b77; --line:#d8dfe4;
+  --known:#2f6584; --forecast:#a9bfcc; --charge:#d98200; --charge-soft:#fbe9cc;
+  --good:#2e7a4c; --warn:#b3261e; --away:#e6ebee;
+  --sans:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,Consolas,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root{
+  --bg:#0e161c; --surface:#16212a; --ink:#e5edf2; --muted:#93a4b0; --line:#2a3843;
+  --known:#6ea4c2; --forecast:#3e5868; --charge:#f2a93b; --charge-soft:#3a2c14;
+  --good:#5fbf86; --warn:#ff8a80; --away:#1b2832; color-scheme:dark;}}
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 var(--sans);
+  padding:max(14px,env(safe-area-inset-top)) max(16px,env(safe-area-inset-right)) max(28px,env(safe-area-inset-bottom)) max(16px,env(safe-area-inset-left))}
+.wrap{max-width:720px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+header{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+h1{font-size:22px;margin:0;letter-spacing:-.01em}
+h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
+.stamp{font:12px var(--mono);color:var(--muted)}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px}
+.decision{border-left:5px solid var(--charge)}
+.decision.ok{border-left-color:var(--good)}
+.decision.bad{border-left-color:var(--warn)}
+.decision h2{margin:0 0 4px;font-size:21px;text-wrap:balance;line-height:1.25}
+.decision .big{font:500 15px var(--mono);margin:6px 0 2px}
+.decision p{margin:6px 0 0;color:var(--muted)}
+.soc{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px}
+.soc label{font-weight:600}
+.soc output{font:500 22px var(--mono);min-width:3.5ch;text-align:right}
+input[type=range]{width:100%;accent-color:var(--charge)}
+.hint{font-size:12.5px;color:var(--muted);margin:6px 0 0}
+.label{font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin:0 0 8px}
+.chartbox{overflow-x:auto;-webkit-overflow-scrolling:touch;margin:0 -4px}
+.chartbox svg{display:block}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:12.5px;color:var(--muted);margin-top:8px}
+.legend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+.timeline{display:flex;flex-direction:column;gap:0}
+.trow{display:grid;grid-template-columns:6.2em 1fr auto;gap:10px;padding:8px 0;border-top:1px solid var(--line);align-items:center;font-variant-numeric:tabular-nums}
+.trow:first-child{border-top:0}
+.trow .when{font-weight:600}
+.trow .what{color:var(--muted);min-width:0}
+.trow .val{font-family:var(--mono);font-size:13.5px;text-align:right}
+.trow.chg .what{color:var(--ink)}
+.pill{display:inline-block;font:500 11px var(--mono);padding:1px 6px;border-radius:99px;background:var(--away);color:var(--muted);margin-left:6px;vertical-align:1px}
+.pill.fc{background:var(--charge-soft);color:var(--charge)}
+details{background:var(--surface);border:1px solid var(--line);border-radius:10px}
+summary{cursor:pointer;padding:13px 16px;font-weight:600;list-style:none;display:flex;justify-content:space-between}
+summary::-webkit-details-marker{display:none}
+summary::after{content:"+";color:var(--muted);font-weight:400}
+details[open] summary::after{content:"–"}
+.panel{padding:0 16px 16px;display:flex;flex-direction:column;gap:12px}
+.grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px}
+.field{display:flex;flex-direction:column;gap:3px;min-width:0}
+.field span{font-size:12.5px;color:var(--muted)}
+input[type=number],input[type=time],select{font:15px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;width:100%}
+input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--charge);outline-offset:2px}
+.week{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+.daybtn{font:500 12.5px var(--sans);border:1px solid var(--line);background:var(--bg);color:var(--muted);border-radius:6px;padding:7px 0;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:1px}
+.daybtn b{color:var(--ink);font-weight:600}
+.daybtn[aria-pressed=true]{background:var(--known);border-color:var(--known);color:#fff}
+.daybtn[aria-pressed=true] b{color:#fff}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.months{display:grid;grid-template-columns:repeat(6,1fr);gap:6px}
+.mbtn{font:500 12px var(--sans);border:1px solid var(--line);border-radius:6px;padding:6px 0;cursor:pointer;display:flex;flex-direction:column;align-items:center;gap:1px;color:var(--ink)}
+.mbtn small{font:500 10.5px var(--mono);opacity:.8}
+.mbtn.s{background:var(--charge-soft);border-color:var(--charge)}
+.mbtn.h{background:var(--bg)}
+.mbtn.w{background:var(--known);border-color:var(--known);color:#fff}
+.mbtn.now{box-shadow:inset 0 -3px 0 var(--ink)}
+.trip{display:grid;grid-template-columns:1fr 6.5em auto;gap:10px;align-items:center}
+.trip .d{font-weight:500}
+.trip .d small{color:var(--muted);font-weight:400;margin-left:4px}
+.linkbtn{background:none;border:0;color:var(--known);font:500 13px var(--sans);cursor:pointer;padding:4px}
+.btn{font:600 14px var(--sans);background:var(--known);color:#fff;border:0;border-radius:8px;padding:10px 14px;cursor:pointer}
+.btn.ghost{background:transparent;color:var(--known);border:1px solid var(--line)}
+.err{color:var(--warn)}
+.note{font-size:12.5px;color:var(--muted)}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Ladeplan <small>ID.3 · DK1</small></h1>
+    <span class="stamp" id="stamp">loading prices…</span>
+  </header>
+
+  <section class="card soc">
+    <label for="soc">Battery now</label>
+    <input type="range" id="soc" min="0" max="100" step="1">
+    <output id="socOut">–</output>
+  </section>
+
+  <section class="card decision" id="decision">
+    <h2 id="dTitle">Fetching prices…</h2>
+    <div class="big" id="dBig"></div>
+    <p id="dSub"></p>
+  </section>
+
+  <section class="card">
+    <p class="label">Total price per kWh, incl. tariffs and VAT</p>
+    <div class="chartbox" id="chart"></div>
+    <div class="legend">
+      <span><i style="background:var(--known)"></i>Known price</span>
+      <span><i style="background:var(--forecast)"></i>Forecast (±1σ)</span>
+      <span><i style="background:var(--charge)"></i>Planned charging</span>
+      <span><i style="background:var(--away);border:1px solid var(--line)"></i>Car away</span>
+    </div>
+  </section>
+
+  <section class="card">
+    <p class="label">Plan</p>
+    <div class="timeline" id="timeline"></div>
+  </section>
+
+  <details id="dTrips">
+    <summary>Next 7 days</summary>
+    <div class="panel">
+      <p class="note">Round-trip km per day. Set 0 for days the car stays home, or raise it for longer trips.</p>
+      <div id="trips" style="display:flex;flex-direction:column;gap:8px"></div>
+    </div>
+  </details>
+
+  <details>
+    <summary>Weekly pattern</summary>
+    <div class="panel">
+      <p class="note">Tap a day to switch between commute and home (WFH or no driving).</p>
+      <div class="week" id="week"></div>
+      <div class="grid2">
+        <label class="field"><span>Commute, one way (km)</span><input type="number" id="kmOneWay" data-k="kmOneWay" step="1" min="0"></label>
+        <label class="field"><span>Leave home</span><input type="time" id="depart" data-k="depart"></label>
+        <label class="field"><span>Back home</span><input type="time" id="home" data-k="home"></label>
+      </div>
+    </div>
+  </details>
+
+  <details>
+    <summary>Car &amp; charging</summary>
+    <div class="panel">
+      <div class="grid2">
+        <label class="field"><span>Usable battery (kWh)</span><input type="number" id="battery" data-k="battery" step="0.5"></label>
+        <label class="field"><span>Arrive with at least (%)</span><input type="number" id="reserve" data-k="reserve" step="1"></label>
+        <label class="field"><span>Charge limit (%)</span><input type="number" id="maxSoc" data-k="maxSoc" step="5"></label>
+        <label class="field"><span>Charger power (kW)</span><input type="number" id="chargerKw" data-k="chargerKw" step="0.5"></label>
+        <label class="field"><span>Charging efficiency (%)</span><input type="number" id="effPct" data-k="effPct" step="1"></label>
+        <label class="field"><span>Always fill below (kr/kWh)</span><input type="number" id="cheapFill" data-k="cheapFill" step="0.05"></label>
+      </div>
+      <p class="note">The charge limit can be exceeded if a long trip needs it. Set "always fill" to 0 to turn it off.</p>
+      <p class="label" style="margin:6px 0 0">Consumption by season, kWh/100 km</p>
+      <div class="grid3">
+        <label class="field"><span>Summer</span><input type="number" id="c_s" data-k="cons.s" step="0.5"></label>
+        <label class="field"><span>Shoulder</span><input type="number" id="c_h" data-k="cons.h" step="0.5"></label>
+        <label class="field"><span>Winter</span><input type="number" id="c_w" data-k="cons.w" step="0.5"></label>
+      </div>
+      <p class="note">Tap a month to change its season. Each trip uses the value for its own date. <span id="consNow"></span></p>
+      <div class="months" id="months"></div>
+    </div>
+  </details>
+
+  <details>
+    <summary>Tariffs &amp; taxes</summary>
+    <div class="panel">
+      <p class="note">Kr/kWh excluding VAT. Defaults are rough estimates; copy the real numbers from your electricity bill or your grid company's website.</p>
+      <div class="grid2">
+        <label class="field"><span>Grid tariff 00–06</span><input type="number" id="t_night" data-k="t.night" step="0.01"></label>
+        <label class="field"><span>Grid tariff 06–17, 21–24</span><input type="number" id="t_day" data-k="t.day" step="0.01"></label>
+        <label class="field"><span>Grid tariff 17–21 (peak)</span><input type="number" id="t_peak" data-k="t.peak" step="0.01"></label>
+        <label class="field"><span>Energinet tariffs</span><input type="number" id="t_energinet" data-k="t.energinet" step="0.01"></label>
+        <label class="field"><span>Elafgift</span><input type="number" id="t_elafgift" data-k="t.elafgift" step="0.001"></label>
+        <label class="field"><span>Supplier markup</span><input type="number" id="t_supplier" data-k="t.supplier" step="0.01"></label>
+        <label class="field"><span>Price area</span><select id="area" data-k="area"><option>DK1</option><option>DK2</option></select></label>
+      </div>
+      <p class="note">Elafgift is temporarily cut to near zero in 2026–2027. Grid tariffs usually rise in winter (October–March).</p>
+    </div>
+  </details>
+
+  <details>
+    <summary>About the forecast</summary>
+    <div class="panel">
+      <p class="note" id="modelInfo">The forecast fits a simple model on the last three weeks: price against wind and solar forecasts for West Denmark and North Germany, temperature, hour of day and weekend. It is refitted every time you open the page.</p>
+      <div class="row">
+        <button class="btn ghost" id="reload" type="button">Refresh data</button>
+        <button class="btn ghost" id="demo" type="button">Show example data</button>
+      </div>
+      <p class="note">Data: Elprisen lige nu (Energi Data Service), Open-Meteo. Settings are stored on this device only.</p>
+    </div>
+  </details>
+</div>
+
+<script>
+"use strict";
+/* ---------- settings ---------- */
+const H = 3600e3;
+const DEF = {
+  soc: 50, kmOneWay: 39, depart: "07:30", home: "17:00",
+  pattern: [1,1,1,1,0,0,0],           // Mon..Sun, 1 = commute
+  battery: 58, reserve: 10, maxSoc: 80, chargerKw: 11, effPct: 90, cheapFill: 0,
+  cons: { s: 14, h: 17, w: 20 },        // kWh/100 km: summer, shoulder, winter
+  seasons: "wwwhhssshhww",             // Jan..Dec
+  area: "DK1",
+  t: { night: 0.15, day: 0.30, peak: 0.70, energinet: 0.14, elafgift: 0.008, supplier: 0.05 },
+  overrides: {}                        // "YYYY-MM-DD" -> round-trip km
+};
+const STORE = "ladeplan.v1";
+// Allowed range per numeric setting; out-of-range values are clamped, non-numbers fall back to the default.
+const LIMITS = {
+  soc:[0,100], kmOneWay:[0,500], battery:[10,200], reserve:[0,50], maxSoc:[50,100], chargerKw:[1,22], effPct:[50,100], cheapFill:[0,5],
+  "cons.s":[5,50], "cons.h":[5,50], "cons.w":[5,50],
+  "t.night":[0,5], "t.day":[0,5], "t.peak":[0,5], "t.energinet":[0,5], "t.elafgift":[0,5], "t.supplier":[-1,5]
+};
+function clone(o){ return JSON.parse(JSON.stringify(o)); }
+function getPath(o,p){ return p.split(".").reduce((a,k)=>a[k], o); }
+function setPath(o,p,v){ const ks=p.split("."); const last=ks.pop(); ks.reduce((a,k)=>a[k], o)[last]=v; }
+function clampSetting(k, v){
+  const [lo,hi]=LIMITS[k];
+  return typeof v==="number" && isFinite(v) ? Math.min(hi, Math.max(lo, v)) : getPath(DEF,k);
+}
+function loadSettings(){
+  let s = clone(DEF);
+  try { const raw = localStorage.getItem(STORE); if (raw){ const p = JSON.parse(raw); s = Object.assign(s, p); s.t = Object.assign(clone(DEF.t), p.t || {}); s.cons = Object.assign(clone(DEF.cons), p.cons || {}); delete s.kwhPer100; if (!/^[shw]{12}$/.test(s.seasons)) s.seasons = DEF.seasons; } } catch(e){}
+  for (const k in LIMITS) setPath(s, k, clampSetting(k, getPath(s,k)));
+  return s;
+}
+function saveSettings(){ try { localStorage.setItem(STORE, JSON.stringify(S)); } catch(e){} }
+
+/* ---------- time helpers (device local time = Danish time) ---------- */
+const pad = n => String(n).padStart(2,"0");
+const dateKey = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const DOW = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+const shortDay = (t, now) => dateKey(new Date(t))===dateKey(now) ? "Today" : DOW[new Date(t).getDay()];
+const monIdx = d => (d.getDay()+6)%7;
+function atTime(day, hhmm){ const [h,m]=hhmm.split(":").map(Number); const d=new Date(day); d.setHours(h,m,0,0); return d; }
+function startOfDay(d){ const x=new Date(d); x.setHours(0,0,0,0); return x; }
+function addDays(d,n){ const x=new Date(d); x.setDate(x.getDate()+n); return x; }
+const hhmm = t => { const d=new Date(t); return `${pad(d.getHours())}:${pad(d.getMinutes())}`; };
+function dayLabel(t, now){
+  const d0=startOfDay(now).getTime(), d=startOfDay(new Date(t)).getTime();
+  const diff=Math.round((d-d0)/864e5);
+  return diff===0?"Today":diff===1?"Tomorrow":DOW[new Date(t).getDay()];
+}
+
+/* ---------- consumption ---------- */
+const SEASON = { s:"Summer", h:"Shoulder", w:"Winter" };
+const consFor = (day, s) => s.cons[s.seasons[new Date(day).getMonth()]];
+
+/* ---------- prices ---------- */
+function tariff(t, s){ const h=new Date(t).getHours(); return h<6 ? s.t.night : (h>=17 && h<21) ? s.t.peak : s.t.day; }
+function totalPrice(spotMWh, t, s){ return (spotMWh/1000 + s.t.supplier + tariff(t,s) + s.t.energinet + s.t.elafgift) * 1.25; }
+
+/* ---------- forecast model ---------- */
+const wpow = ws => Math.min(1, Math.max(0, (ws-3)/9));   // rough wind-turbine output curve, 0..1
+function features(t, w){
+  const d=new Date(t), h=d.getHours(), dow=d.getDay();
+  const f=[1, w.wind, w.wind*w.wind, w.solar, w.temp, (dow===0||dow===6)?1:0];
+  for (let i=1;i<24;i++) f.push(h===i?1:0);
+  return f;
+}
+function solve(A,b){
+  const n=b.length, M=A.map((r,i)=>[...r,b[i]]);
+  for (let c=0;c<n;c++){
+    let p=c; for (let r=c+1;r<n;r++) if (Math.abs(M[r][c])>Math.abs(M[p][c])) p=r;
+    [M[c],M[p]]=[M[p],M[c]];
+    const piv=M[c][c]||1e-12;
+    for (let r=0;r<n;r++){ if(r===c) continue; const f=M[r][c]/piv; if(!f) continue; for (let k=c;k<=n;k++) M[r][k]-=f*M[c][k]; }
+  }
+  return M.map((r,i)=>r[n]/(r[i]||1e-12));
+}
+function fitModel(rows, nowMs){
+  // rows: [{t, x:[...], y}] ; recency-weighted ridge regression
+  const p=rows[0].x.length, A=Array.from({length:p},()=>new Array(p).fill(0)), b=new Array(p).fill(0);
+  const halfLife=7*24*H;
+  for (const r of rows){
+    const w=Math.pow(0.5,(nowMs-r.t)/halfLife);
+    for (let i=0;i<p;i++){ b[i]+=w*r.x[i]*r.y; for (let j=0;j<p;j++) A[i][j]+=w*r.x[i]*r.x[j]; }
+  }
+  for (let i=1;i<p;i++) A[i][i]+=2;    // light ridge, intercept free
+  const beta=solve(A,b);
+  const pred=x=>x.reduce((a,v,i)=>a+v*beta[i],0);
+  let se=0, ae=0, n=0;
+  for (const r of rows){ if (nowMs-r.t>7*24*H) continue; const e=r.y-pred(r.x); se+=e*e; ae+=Math.abs(e); n++; }
+  return { pred, sigma: Math.sqrt(se/Math.max(1,n)), mae: ae/Math.max(1,n), n: rows.length };
+}
+
+/* ---------- data fetch ---------- */
+const POINTS = [[55.5,8.3],[56.9,8.5],[55.8,7.0],[54.4,9.0],[53.6,10.0]]; // DK west coast, Thy, North Sea, N Germany
+// One file per day from elprisenligenu.dk: [{DKK_per_kWh, time_start:"…+02:00"}], spot excl. VAT.
+// Returns Map(UTC hour ms -> DKK/MWh); sub-hourly records are averaged.
+function parsePrices(days){
+  const acc=new Map();
+  for (const recs of days) for (const rec of recs||[]){
+    if (rec.DKK_per_kWh==null) continue;
+    const t=Math.floor(Date.parse(rec.time_start)/H)*H;
+    if (!isFinite(t)) continue;
+    const a=acc.get(t)||[0,0]; a[0]+=rec.DKK_per_kWh*1000; a[1]++; acc.set(t,a);
+  }
+  const m=new Map(); for (const [t,[s,n]] of acc) m.set(t,s/n); return m;
+}
+async function fetchPrices(area, now){
+  const today=startOfDay(now), days=[];
+  for (let i=-22;i<=2;i++) days.push(addDays(today,i));
+  const got=await Promise.all(days.map(async (d,i)=>{
+    const url=`https://www.elprisenligenu.dk/api/v1/prices/${d.getFullYear()}/${pad(d.getMonth()+1)}-${pad(d.getDate())}_${area}.json`;
+    // Future days 404 until published (~13:00) and the 404 is cacheable for hours, so bypass the cache for them.
+    const r=await fetch(url, d>today ? {cache:"no-store"} : {});
+    if (r.status===404) return null;
+    if (!r.ok) throw new Error("Price server answered "+r.status);
+    return r.json();
+  }));
+  if (!got[22]) throw new Error("No prices for today yet");
+  return parsePrices(got);
+}
+async function fetchWeather(){
+  const url=`https://api.open-meteo.com/v1/forecast?latitude=${POINTS.map(p=>p[0]).join(",")}&longitude=${POINTS.map(p=>p[1]).join(",")}&hourly=wind_speed_100m,shortwave_radiation,temperature_2m&wind_speed_unit=ms&past_days=22&forecast_days=4&timezone=UTC&timeformat=unixtime`;
+  const r=await fetch(url); if(!r.ok) throw new Error("Open-Meteo answered "+r.status);
+  let j=await r.json(); if(!Array.isArray(j)) j=[j];
+  const m=new Map(), k=j.length;
+  j.forEach(loc=>{
+    const hr=loc.hourly;
+    hr.time.forEach((ts,i)=>{
+      const t=ts*1000, w=m.get(t)||{wind:0,solar:0,temp:0,n:0};
+      const ws=hr.wind_speed_100m[i], sr=hr.shortwave_radiation[i], tp=hr.temperature_2m[i];
+      if (ws==null||sr==null||tp==null) return;
+      w.wind+=wpow(ws); w.solar+=sr/1000; w.temp+=tp/10; w.n++; m.set(t,w);
+    });
+  });
+  for (const [t,w] of m){ if (w.n<k){ m.delete(t); continue; } w.wind/=w.n; w.solar/=w.n; w.temp/=w.n; }
+  return m;
+}
+function demoData(now){
+  const prices=new Map(), weather=new Map();
+  const t0=Math.floor(addDays(now,-22).getTime()/H)*H, t1=startOfDay(addDays(now,3)).getTime();
+  const cut = now.getHours()>=13 ? startOfDay(addDays(now,2)).getTime() : startOfDay(addDays(now,1)).getTime();
+  let seed=7; const rnd=()=>{ seed=(seed*16807)%2147483647; return seed/2147483647-0.5; };
+  for (let t=t0;t<t1;t+=H){
+    const d=new Date(t), h=d.getHours();
+    const wind=Math.min(1,Math.max(0,0.5+0.45*Math.sin(t/(H*29))+0.2*Math.sin(t/(H*71))));
+    const solar=Math.max(0,Math.sin((h-7)/10*Math.PI))*0.35;
+    const temp=0.9+0.3*Math.sin(t/(H*120));
+    weather.set(t,{wind,solar,temp});
+    const prof=[-.15,-.2,-.22,-.22,-.18,-.05,.15,.3,.25,.1,0,-.05,-.08,-.05,0,.08,.2,.35,.4,.3,.15,.05,-.02,-.1][h];
+    const wk=(d.getDay()===0||d.getDay()===6)?-120:0;
+    if (t<cut) prices.set(t, Math.max(-50, 1050 - 950*wind - 500*solar + 600*prof + wk + 80*rnd()));
+  }
+  return {prices, weather};
+}
+
+/* ---------- build hours and plan ---------- */
+function buildHours(prices, weather, s, now){
+  const nowMs=now.getTime();
+  const rows=[];
+  for (const [t,y] of prices){ const w=weather.get(t); if (w) rows.push({t, x:features(t,w), y}); }
+  const model = rows.length>200 ? fitModel(rows, nowMs) : null;
+  const startH=Math.floor(nowMs/H)*H;
+  const end=startOfDay(addDays(now,3)).getTime();
+  const hours=[];
+  for (let t=startH;t<end;t+=H){
+    let spot=prices.get(t), fc=false, sig=0;
+    if (spot==null){
+      const w=weather.get(t); if(!w || !model) continue;
+      spot=model.pred(features(t,w)); fc=true;
+      sig=model.sigma*Math.min(1.6, 1+(t-startH)/(72*H));   // uncertainty grows with lead time
+    }
+    hours.push({ t, spot, fc, price: totalPrice(spot,t,s), sigma: sig/1000*1.25 });
+  }
+  return { hours, model };
+}
+
+function drivesFor(s, now, horizonEnd){
+  const ev=[];
+  const need = (km, day) => km*consFor(day, s)/100;
+  for (let i=0;i<4;i++){
+    const day=addDays(startOfDay(now),i), key=dateKey(day);
+    const km = s.overrides[key]!=null ? s.overrides[key] : (s.pattern[monIdx(day)] ? 2*s.kmOneWay : 0);
+    if (km<=0) continue;
+    const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
+    if (dep>=horizonEnd) continue;
+    if (dep>now.getTime()) ev.push({t:dep, back, km, need:need(km,day), key, check:true});
+    else if (back>now.getTime()) ev.push({t:back, back, km:km/2, need:need(km,day)/2, key, check:false, returning:true});
+  }
+  return ev;
+}
+
+function plan(hours, s, now){
+  const nowMs=now.getTime(), B=s.battery, eff=s.effPct/100;
+  const res=B*s.reserve/100, soc0=B*s.soc/100;
+  const end = hours.length ? hours[hours.length-1].t+H : nowMs;
+  const events=drivesFor(s, now, end).sort((a,b)=>a.t-b.t);
+  const away=(t0,t1)=>events.some(e=>{ const dep=e.returning?nowMs:e.t; return t0<e.back && t1>dep; });
+  const slots=hours.map(h=>{
+    const st=Math.max(h.t,nowMs), frac=(h.t+H-st)/H;
+    return {...h, home:!away(h.t,h.t+H), capK:s.chargerKw*eff*frac, charge:0, rank:h.price+(h.fc?0.5*h.sigma:0)};
+  });
+  function sim(){
+    let lvl=soc0, ei=0; const after=[], before=[];
+    for (let i=0;i<slots.length;i++){
+      while (ei<events.length && events[ei].t<=slots[i].t){ before[ei]=lvl; lvl-=events[ei].need; ei++; }
+      lvl+=slots[i].charge; after[i]=lvl;
+    }
+    while (ei<events.length){ before[ei]=lvl; lvl-=events[ei].need; ei++; }
+    return {after, before, endLvl:lvl};
+  }
+  function headroom(i, cap){ const {after}=sim(); let mx=-Infinity; for (let j=i;j<after.length;j++) mx=Math.max(mx,after[j]); return cap-mx; }
+  const order = idx => idx.sort((a,b)=>slots[a].rank-slots[b].rank);
+  events.forEach((ev,k)=>{
+    if (!ev.check) return;
+    for (const cap of [B*s.maxSoc/100, B]){
+      let def=res+ev.need-sim().before[k];
+      if (def<=0.01) break;
+      const cand=order(slots.map((_,i)=>i).filter(i=>slots[i].home && slots[i].t+H<=ev.t));
+      for (const i of cand){
+        if (def<=0.01) break;
+        const amt=Math.min(slots[i].capK-slots[i].charge, def, headroom(i,cap));
+        if (amt>0.01){ slots[i].charge+=amt; def-=amt; }
+      }
+      ev.short = def>0.05 ? def : 0;
+    }
+  });
+  if (s.cheapFill>0){
+    for (const i of order(slots.map((_,i)=>i).filter(i=>slots[i].home && slots[i].price<=s.cheapFill))){
+      const amt=Math.min(slots[i].capK-slots[i].charge, headroom(i,B*s.maxSoc/100));
+      if (amt>0.01) slots[i].charge+=amt;
+    }
+  }
+  const {before, endLvl}=sim();
+  events.forEach((e,k)=>{ e.lvlBefore=before[k]; e.lvlAfter=before[k]-e.need; });
+  // contiguous charging blocks
+  const blocks=[]; let cur=null;
+  slots.forEach(sl=>{
+    if (sl.charge>0.01){
+      const grid=sl.charge/eff, cost=grid*sl.price;
+      if (cur && sl.t===cur.end){ cur.end=sl.t+H; cur.kwh+=grid; cur.cost+=cost; cur.fc=cur.fc||sl.fc; }
+      else { cur={start:Math.max(sl.t,nowMs), end:sl.t+H, kwh:grid, cost, fc:sl.fc}; blocks.push(cur); }
+    } else cur=null;
+  });
+  return { slots, events, blocks, endLvl, B };
+}
+
+/* ---------- rendering ---------- */
+const S = loadSettings();
+let DATA=null, MODEL=null, DEMO=false;
+const fmtKr = v => v.toFixed(2).replace(".",",");
+const pct = (kwh,B) => Math.round(kwh/B*100);
+
+// Headline for the decision card; pure so it can be tested. cls: "" (charge), "ok" or "bad".
+function decide(P, now, s){
+  const short=P.events.find(e=>e.short>0);
+  const first=P.blocks[0];
+  const tonightEnd=atTime(addDays(startOfDay(now),1),s.depart).getTime();
+  const nextDrive=P.events.find(e=>e.check);
+  if (short) return { cls:"bad",
+    title:`Not enough time to charge for ${dayLabel(short.t,now).toLowerCase()}`,
+    big:`${short.need.toFixed(1)} kWh needed · ${short.short.toFixed(1)} kWh short`,
+    sub:"Charge as soon as you can, or lower the reserve or trip length." };
+  if (!first){
+    const last=P.slots.length?P.slots[P.slots.length-1].t:now.getTime();
+    return { cls:"ok", title:"No charging needed",
+      big:`Battery ends around ${pct(P.endLvl,P.B)}% on ${DOW[new Date(last).getDay()]}`,
+      sub:"Your commute is covered with your reserve intact for the days shown." };
+  }
+  const label=`${dayLabel(first.start,now)} ${hhmm(first.start)}–${hhmm(first.end)}`;
+  const avg=fmtKr(first.cost/first.kwh);
+  if (first.start<tonightEnd && !first.fc){
+    const hrs=new Date(first.start).getHours();
+    return { cls:"",
+      title: first.start<=now.getTime()+H ? "Charge now" : (hrs>=18 || hrs<9 || dayLabel(first.start,now)!=="Today") ? "Charge tonight" : "Charge today",
+      big:`${label} · ${first.kwh.toFixed(1)} kWh · ≈ ${Math.round(first.cost)} kr`,
+      sub:`Average ${avg} kr/kWh, based on known prices.` + (P.blocks.length>1?` ${P.blocks.length-1} more charging window${P.blocks.length>2?"s":""} planned later.`:"") };
+  }
+  if (first.start<tonightEnd) return { cls:"",
+    title:"Probably charge tonight",
+    big:`${label} · ${first.kwh.toFixed(1)} kWh (forecast)`,
+    sub:`Expected ≈ ${avg} kr/kWh. Check again after 13:00 when tomorrow's prices are published.` };
+  return { cls:"ok",
+    title:"Wait, no need to charge tonight",
+    big:`Next: ${label} · ${first.kwh.toFixed(1)} kWh${first.fc?" (forecast)":""}`,
+    sub: first.fc
+      ? `Expected ≈ ${avg} kr/kWh. ${nextDrive?`You still reach home from ${dayLabel(nextDrive.t,now).toLowerCase()}'s commute with ${pct(nextDrive.lvlAfter,P.B)}%. `:""}Check again after 13:00 when tomorrow's prices are published.`
+      : `Known price ≈ ${avg} kr/kWh.` };
+}
+function renderDecision(P, now){
+  const d=decide(P, now, S);
+  document.getElementById("decision").className="card decision"+(d.cls?" "+d.cls:"");
+  document.getElementById("dTitle").textContent=d.title;
+  document.getElementById("dBig").textContent=d.big;
+  document.getElementById("dSub").textContent=d.sub;
+}
+
+function renderChart(P, now){
+  const el=document.getElementById("chart"), sl=P.slots;
+  if (!sl.length){ el.innerHTML=""; return; }
+  const bw=11, L=40, R=8, T=12, Hh=170, Bt=34, W=L+sl.length*bw+R, Ht=T+Hh+Bt;
+  const maxV=Math.max(1, ...sl.map(s=>s.price+s.sigma)), minV=Math.min(0, ...sl.map(s=>s.price-s.sigma));
+  const step = maxV-minV>4 ? 1 : maxV-minV>1.6 ? 0.5 : 0.25;
+  const top=Math.ceil(maxV/step)*step, bot=Math.floor(minV/step)*step;
+  const y=v=>T+Hh*(top-v)/(top-bot);
+  let g="";
+  for (let v=bot; v<=top+1e-9; v+=step){
+    g+=`<line x1="${L}" x2="${W-R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--line)" stroke-width="1"/>`;
+    g+=`<text x="${L-6}" y="${y(v)+4}" text-anchor="end" font-size="10.5" fill="var(--muted)" font-family="var(--mono)">${v.toFixed(step<0.5?2:step<1?1:0).replace(".",",")}</text>`;
+  }
+  sl.forEach((s,i)=>{
+    const x=L+i*bw;
+    if (!s.home) g+=`<rect x="${x}" y="${T}" width="${bw}" height="${Hh}" fill="var(--away)"/>`;
+  });
+  sl.forEach((s,i)=>{
+    const x=L+i*bw, d=new Date(s.t), h=d.getHours();
+    const y0=y(Math.max(0,s.price)), y1=y(Math.min(0,s.price));
+    const col = s.charge>0.01 ? "var(--charge)" : s.fc ? "var(--forecast)" : "var(--known)";
+    g+=`<rect x="${x+1}" y="${y0}" width="${bw-2}" height="${Math.max(1,y1-y0)}" fill="${col}" rx="1"/>`;
+    if (s.fc && s.sigma>0){ const cx=x+bw/2; g+=`<line x1="${cx}" x2="${cx}" y1="${y(s.price+s.sigma)}" y2="${y(s.price-s.sigma)}" stroke="var(--muted)" stroke-width="1" opacity=".55"/>`; }
+    if (h===0 || (i===0 && h<16)){
+      g+=`<line x1="${x}" x2="${x}" y1="${T}" y2="${T+Hh+20}" stroke="var(--muted)" stroke-width="1" opacity=".5"/>`;
+      g+=`<text x="${x+4}" y="${T+Hh+30}" font-size="11.5" font-weight="600" fill="var(--ink)" font-family="var(--sans)">${dayLabel(s.t,now)} ${d.getDate()}/${d.getMonth()+1}</text>`;
+    }
+    if (h%6===0) g+=`<text x="${x+bw/2}" y="${T+Hh+13}" text-anchor="middle" font-size="10" fill="var(--muted)" font-family="var(--mono)">${pad(h)}</text>`;
+  });
+  el.innerHTML=`<svg width="${W}" height="${Ht}" viewBox="0 0 ${W} ${Ht}" role="img" aria-label="Hourly electricity price with planned charging">${g}</svg>`;
+}
+
+function renderTimeline(P, now){
+  const items=[];
+  P.blocks.forEach(b=>items.push({t:b.start, html:`<div class="trow chg"><div class="when">${shortDay(b.start,now)} ${hhmm(b.start)}</div><div class="what">Charge until ${hhmm(b.end)}${b.fc?'<span class="pill fc">forecast</span>':''}</div><div class="val">${b.kwh.toFixed(1)} kWh · ${Math.round(b.cost)} kr</div></div>`}));
+  P.events.forEach(e=>items.push({t:e.t, html:`<div class="trow"><div class="when">${shortDay(e.t,now)} ${hhmm(e.t)}</div><div class="what">${e.returning?"Driving home":"Leave"} · ${Math.round(e.km)} km · ${e.need.toFixed(1)} kWh</div><div class="val">${pct(e.lvlBefore,P.B)}% → ${pct(e.lvlAfter,P.B)}%</div></div>`}));
+  items.sort((a,b)=>a.t-b.t);
+  const tot=P.blocks.reduce((a,b)=>a+b.cost,0), kwh=P.blocks.reduce((a,b)=>a+b.kwh,0);
+  document.getElementById("timeline").innerHTML = items.length
+    ? items.map(i=>i.html).join("") + (kwh>0?`<div class="trow"><div class="when">Total</div><div class="what">${kwh.toFixed(1)} kWh from the grid</div><div class="val">≈ ${Math.round(tot)} kr</div></div>`:"")
+    : `<p class="note">No trips or charging in the next days.</p>`;
+}
+
+function renderTrips(now){
+  const box=document.getElementById("trips"); box.innerHTML="";
+  for (let i=0;i<7;i++){
+    const day=addDays(startOfDay(now),i), key=dateKey(day);
+    const pat=S.pattern[monIdx(day)]?2*S.kmOneWay:0, ov=S.overrides[key];
+    const row=document.createElement("div"); row.className="trip";
+    row.innerHTML=`<div class="d">${i===0?"Today":i===1?"Tomorrow":DOW[day.getDay()]}<small>${day.getDate()}/${day.getMonth()+1}</small></div>
+      <input type="number" min="0" step="1" id="trip_${key}" aria-label="Kilometres on ${key}" value="${ov!=null?ov:pat}">
+      <button type="button" class="linkbtn" ${ov==null?"hidden":""}>Reset</button>`;
+    row.querySelector("input").addEventListener("change",e=>{
+      const v=Math.max(0,Number(e.target.value)||0);
+      if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
+      saveSettings(); renderTrips(now); recompute();
+    });
+    row.querySelector("button").addEventListener("click",()=>{ delete S.overrides[key]; saveSettings(); renderTrips(now); recompute(); });
+    box.appendChild(row);
+  }
+}
+
+function renderWeek(){
+  const box=document.getElementById("week"); box.innerHTML="";
+  ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"].forEach((n,i)=>{
+    const b=document.createElement("button"); b.type="button"; b.className="daybtn";
+    b.setAttribute("aria-pressed", S.pattern[i]?"true":"false");
+    b.innerHTML=`<b>${n}</b>${S.pattern[i]?"Commute":"Home"}`;
+    b.addEventListener("click",()=>{ S.pattern[i]=S.pattern[i]?0:1; saveSettings(); renderWeek(); renderTrips(new Date()); recompute(); });
+    box.appendChild(b);
+  });
+}
+
+function renderMonths(){
+  const box=document.getElementById("months"); box.innerHTML="";
+  const cur=new Date().getMonth();
+  ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"].forEach((n,i)=>{
+    const k=S.seasons[i], b=document.createElement("button");
+    b.type="button"; b.className=`mbtn ${k}${i===cur?" now":""}`;
+    b.setAttribute("aria-label",`${n}: ${SEASON[k]}, ${S.cons[k]} kWh per 100 km. Tap to change.`);
+    b.innerHTML=`<b>${n}</b><small>${S.cons[k]}</small>`;
+    b.addEventListener("click",()=>{
+      const next={s:"h",h:"w",w:"s"}[k];
+      S.seasons=S.seasons.slice(0,i)+next+S.seasons.slice(i+1);
+      saveSettings(); renderMonths(); recompute();
+    });
+    box.appendChild(b);
+  });
+  const k=S.seasons[cur];
+  document.getElementById("consNow").textContent=`Now: ${SEASON[k].toLowerCase()}, ${S.cons[k]} kWh/100 km.`;
+}
+
+function bindInputs(){
+  document.querySelectorAll("[data-k]").forEach(el=>{
+    const k=el.dataset.k;
+    el.value=getPath(S, k);
+    if (LIMITS[k]){ el.min=LIMITS[k][0]; el.max=LIMITS[k][1]; }
+    el.addEventListener("change",()=>{
+      let v = el.value;
+      if (el.type==="number"){
+        // An emptied field keeps the previous value instead of becoming 0
+        if (v.trim()==="" || !isFinite(Number(v))){ el.value=getPath(S,k); return; }
+        v = LIMITS[k] ? clampSetting(k, Number(v)) : Number(v);
+        el.value=v;
+      }
+      setPath(S, k, v); saveSettings();
+      if (el.dataset.k==="area") return load();
+      if (el.dataset.k==="kmOneWay") renderTrips(new Date());
+      if (el.dataset.k.startsWith("cons.")) renderMonths();
+      recompute();
+    });
+  });
+  const soc=document.getElementById("soc"), out=document.getElementById("socOut");
+  soc.value=S.soc; out.textContent=S.soc+"%";
+  soc.addEventListener("input",()=>{ S.soc=Number(soc.value); out.textContent=S.soc+"%"; recompute(); });
+  soc.addEventListener("change",saveSettings);
+  document.getElementById("reload").addEventListener("click",()=>{ DEMO=false; load(); });
+  document.getElementById("demo").addEventListener("click",()=>{ DEMO=true; load(); });
+}
+
+function recompute(){
+  if (!DATA) return;
+  const now=new Date();
+  const {hours, model}=buildHours(DATA.prices, DATA.weather, S, now);
+  MODEL=model;
+  const P=plan(hours, S, now);
+  renderDecision(P, now); renderChart(P, now); renderTimeline(P, now);
+  if (model) document.getElementById("modelInfo").textContent =
+    `The forecast fits a simple model on the last three weeks (${model.n} hours): price against wind and solar forecasts for West Denmark and North Germany, temperature, hour of day and weekend. Typical error over the past week: ±${fmtKr(model.mae/1000*1.25)} kr/kWh. Forecast hours are ranked slightly pessimistically, so the plan only waits for a forecast when it is clearly cheaper.`;
+}
+
+async function load(){
+  const now=new Date(), stamp=document.getElementById("stamp");
+  stamp.textContent="loading prices…";
+  try {
+    if (DEMO) { DATA=demoData(now); stamp.textContent="example data"; }
+    else {
+      // Weather only feeds the forecast; without it we still plan on known prices.
+      const [pr, wr]=await Promise.allSettled([fetchPrices(S.area, now), fetchWeather()]);
+      if (pr.status==="rejected") throw pr.reason;
+      const prices=pr.value, weather=wr.status==="fulfilled" ? wr.value : new Map();
+      if (!prices.size) throw new Error("No prices received");
+      DATA={prices, weather};
+      const last=Math.max(...prices.keys());
+      stamp.textContent=`prices until ${DOW[new Date(last+H).getDay()]} ${hhmm(last+H)} · ${hhmm(now)}` + (weather.size?"":" · no forecast");
+    }
+    recompute();
+  } catch(e){
+    DATA=null;
+    stamp.textContent="offline";
+    const box=document.getElementById("decision"); box.className="card decision bad";
+    document.getElementById("dTitle").textContent="Couldn't load prices";
+    document.getElementById("dBig").textContent=String(e.message||e);
+    document.getElementById("dSub").innerHTML='Check your connection and tap Refresh. The page must be opened from a normal web address. <button class="linkbtn" type="button" id="tryDemo">Show example data</button>';
+    document.getElementById("tryDemo").onclick=()=>{ DEMO=true; load(); };
+  }
+}
+
+if (typeof document!=="undefined" && document.getElementById("decision")){
+  // drop overrides older than today
+  const today=dateKey(new Date()); for (const k of Object.keys(S.overrides)) if (k<today) delete S.overrides[k];
+  bindInputs(); renderWeek(); renderMonths(); renderTrips(new Date()); load();
+  document.addEventListener("visibilitychange",()=>{ if (document.visibilityState==="visible") load(); });
+}
+</script>
+</body>
+</html>
