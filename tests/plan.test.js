@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, socEstimate, logReading, relogKm, deviates } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, socEstimate, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -488,6 +488,93 @@ test("settingsFrom drops malformed SOC history", () => {
   assert.deepStrictEqual(s.planned, [[1, 2]]);
   assert.strictEqual(s.socLog.length, 1);
   assert.deepStrictEqual(stored({}).planned, []);
+});
+
+/* ---------- accept or reject the plan ---------- */
+// Mon 19 Oct 21:00, commute Tue 07:30: from 20% the plan must charge tonight.
+const NIGHT = "2026-10-19T21:00";
+const before = (P, c) => P.blocks.filter(b => b.start < c.until);
+
+test("accepting locks the session even when prices change", () => {
+  const { P, s, now } = run(NIGHT, s => { s.soc = 20; });
+  const c = commitFrom(P, "plan", now);
+  assert.strictEqual(c.kind, "plan");
+  assert.strictEqual(c.until, ms("2026-10-20T07:30"));
+  assert.ok(c.windows.length >= 1 && c.limit >= 50);
+  s.commit = c;
+  const d = demoData(now);
+  for (const [t, v] of d.prices) d.prices.set(t, new Date(t).getHours() === 22 ? 50 : v + 400);   // 22:00 now much cheaper
+  const P2 = plan(buildHours(d.prices, d.weather, s, now).hours, s, now);
+  assert.deepStrictEqual(before(P2, c).map(b => [Math.round(b.start), Math.round(b.end)]), c.windows);
+  const card = decide(P2, now, s, null);
+  assert.ok(card.committed && card.lvl === "Accepted", card.lvl);
+  assert.ok(!card.choose);
+});
+
+test("an own timer window becomes the session, stopped at its limit", () => {
+  const { P, s, now } = run(NIGHT, s => { s.soc = 20; });
+  s.commit = commitFrom(P, "manual", now, { start: "23:00", end: "06:00", limit: 50 });
+  assert.deepStrictEqual(s.commit.windows, [[ms("2026-10-19T23:00"), ms("2026-10-20T06:00")]]);
+  const { hours } = buildHours(demoData(now).prices, demoData(now).weather, s, now);
+  const P2 = plan(hours, s, now), b = before(P2, s.commit);
+  assert.strictEqual(b[0].start, ms("2026-10-19T23:00"));
+  assert.ok(Math.abs(b[b.length - 1].lvlEnd - 0.5 * 58) < 0.05, b[b.length - 1].lvlEnd);   // 30% → 20% → 50% limit
+  const card = decide(P2, now, s, null);
+  assert.strictEqual(card.lvl, "Your timer");
+  assert.deepStrictEqual(card.setup, { limit: 50, timers: ["23:00–06:00"], hint: "" });
+});
+
+test("not charging warns when it leaves the commute short", () => {
+  const { P, s, now, hours } = run(NIGHT, s => { s.soc = 20; });
+  s.commit = commitFrom(P, "none", now);
+  const P2 = plan(hours, s, now);
+  assert.strictEqual(before(P2, s.commit).length, 0);
+  const card = decide(P2, now, s, null);
+  assert.strictEqual(card.cls, "bad");
+  assert.ok(card.title.startsWith("Your choice leaves tomorrow short"), card.title);
+});
+
+test("not charging with enough battery shows the arrival level", () => {
+  const { P, s, now, hours } = run(NIGHT, s => { s.soc = 70; s.cheapFill = 5; });   // cheap fill proposes charging
+  s.commit = commitFrom(P, "none", now);
+  const card = decide(plan(hours, s, now), now, s, null);
+  assert.strictEqual(card.cls, "ok");
+  assert.strictEqual(card.title, "No charging before you leave tomorrow 07:30");
+  assert.ok(card.sub.includes("You get home from tomorrow's drive with"), card.sub);
+});
+
+test("a choice expires when the car leaves", () => {
+  const { P, s, now } = run(NIGHT, s => { s.soc = 20; });
+  s.commit = commitFrom(P, "none", now);
+  const later = new Date("2026-10-20T18:00");
+  const d = demoData(later), P2 = plan(buildHours(d.prices, d.weather, s, later).hours, s, later);
+  assert.strictEqual(P2.commit, null);
+});
+
+test("own timer: start in the past means now, clipped to departure, null if after it", () => {
+  const { P, now } = run(NIGHT, s => { s.soc = 20; });
+  assert.deepStrictEqual(commitFrom(P, "manual", now, { start: "20:00", end: "09:00", limit: 80 }).windows,
+    [[now.getTime(), ms("2026-10-20T07:30")]]);
+  assert.strictEqual(commitFrom(P, "manual", now, { start: "08:00", end: "10:00", limit: 80 }), null);
+});
+
+test("settingsFrom keeps a valid choice and drops a malformed one", () => {
+  const c = { kind: "manual", until: 5, windows: [[1, 2]], limit: 80, at: 0 };
+  assert.deepStrictEqual(stored({ commit: c }).commit, c);
+  assert.strictEqual(stored({ commit: { ...c, kind: "x" } }).commit, null);
+  assert.strictEqual(stored({ commit: { ...c, limit: 30 } }).commit, null);
+  assert.strictEqual(stored({ commit: { ...c, windows: [[2, 1]] } }).commit, null);
+  assert.strictEqual(stored({ commit: { ...c, kind: "none", limit: null } }).commit.limit, null);
+  assert.deepStrictEqual(stored({ planned: [[1, 2, 1], [1, 2, 7]] }).planned, [[1, 2, 1]]);
+});
+
+test("estimate tells chosen charging from assumed", () => {
+  const s = soc("2026-10-18T20:00", s => { s.soc = 40; s.planned = [[ms("2026-10-18T22:00"), ms("2026-10-18T23:00"), 1], [ms("2026-10-19T01:00"), ms("2026-10-19T02:00")]]; });
+  const e = socEstimate(s, new Date("2026-10-19T18:00")), kw = 11 * 0.9;
+  assert.ok(Math.abs(e.chargedKwh - 2 * kw) < 1e-9 && Math.abs(e.chosenKwh - kw) < 1e-9);
+  const { P, now } = run(NIGHT, s => { s.soc = 20; });
+  P.commit = commitFrom(P, "plan", now);
+  assert.ok(notePlanned([], P, now, { socAt: null }).every(w => w[2] === 1));
 });
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
