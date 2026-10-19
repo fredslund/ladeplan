@@ -490,6 +490,15 @@ test("settingsFrom drops malformed SOC history", () => {
   assert.deepStrictEqual(stored({}).planned, []);
 });
 
+test("settingsFrom keeps the car name and a valid price area", () => {
+  assert.strictEqual(stored({}).car, "ID.3");
+  assert.strictEqual(stored({ car: "  Kona  " }).car, "Kona");
+  assert.strictEqual(stored({ car: 3 }).car, "ID.3");
+  assert.strictEqual(stored({ car: "x".repeat(40) }).car.length, 24);
+  assert.strictEqual(stored({ area: "DK2" }).area, "DK2");
+  assert.strictEqual(stored({ area: "SE3" }).area, "DK1");
+});
+
 /* ---------- accept or reject the plan ---------- */
 // Mon 19 Oct 21:00, commute Tue 07:30: from 20% the plan must charge tonight.
 const NIGHT = "2026-10-19T21:00";

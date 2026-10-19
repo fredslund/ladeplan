@@ -3,6 +3,7 @@
 /* ---------- settings ---------- */
 const H = 3600e3;
 const DEF = {
+  car: "ID.3",                         // shown in the header only
   soc: 50, kmOneWay: 39, depart: "07:30", home: "17:00",
   pattern: [1,1,1,1,0,0,0],           // Mon..Sun, 1 = commute
   battery: 58, reserve: 10, maxSoc: 80, chargerKw: 11, effPct: 90, cheapFill: 0,
@@ -22,6 +23,7 @@ const DEF = {
 };
 const STORE = "ladeplan.v1";
 const LOG_MAX = 60;
+const CAR_MAX = 24;
 // Allowed range per numeric setting; out-of-range values are clamped, non-numbers fall back to the default.
 const LIMITS = {
   soc:[0,100], kmOneWay:[0,500], battery:[10,200], reserve:[0,50], maxSoc:[50,100], chargerKw:[1,22], effPct:[50,100], cheapFill:[0,5], oneWindowKr:[0,50],
@@ -56,6 +58,8 @@ function settingsFrom(raw){
   let s = clone(DEF);
   try { if (raw){ const p = JSON.parse(raw); s = Object.assign(s, p); s.t = migrateTariffs(Object.assign(clone(DEF.t), p.t || {})); s.cons = Object.assign(clone(DEF.cons), p.cons || {}); delete s.kwhPer100; if (!/^[shw]{12}$/.test(s.seasons)) s.seasons = DEF.seasons; } } catch(e){}
   for (const k in LIMITS) setPath(s, k, clampSetting(k, getPath(s,k)));
+  s.car = typeof s.car==="string" ? s.car.trim().slice(0, CAR_MAX) : DEF.car;
+  if (!["DK1","DK2"].includes(s.area)) s.area = DEF.area;
   const num=Number.isFinite;
   if (!num(s.socAt)) s.socAt=null;
   const win=w=>Array.isArray(w) && num(w[0]) && num(w[1]) && w[0]<w[1];

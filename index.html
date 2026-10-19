@@ -103,7 +103,7 @@ details[open] summary::after{content:"–"}
 .field{display:flex;flex-direction:column;gap:3px;min-width:0}
 .field span{font-size:12.5px;color:var(--muted)}
 /* 16px minimum: iOS Safari zooms in on focus for smaller text in form fields */
-input[type=number],input[type=time],select{font:16px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;width:100%}
+input[type=number],input[type=time],input[type=text],select{font:16px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;width:100%}
 input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--charge);outline-offset:2px}
 /* minmax(0,1fr): columns may shrink below their text, so seven days fit a 320px phone */
 .week{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:4px}
@@ -145,7 +145,7 @@ a.inl{color:var(--known)}
 <div class="wrap">
 <div class="view" id="mainView">
   <header>
-    <h1>Ladeplan <small>ID.3 · DK1</small></h1>
+    <h1>Ladeplan <small id="hdrSub"></small></h1>
     <div class="hright">
       <span class="stamp" id="stamp">loading prices…</span>
       <a href="#settings" class="iconbtn" id="openSettings" aria-label="Settings" title="Settings">
@@ -228,6 +228,7 @@ a.inl{color:var(--known)}
   <section class="card set">
     <h2 class="sh">Car &amp; charging</h2>
       <div class="grid2">
+        <label class="field"><span>Car model</span><input type="text" id="car" data-k="car" maxlength="24" autocomplete="off"></label>
         <label class="field"><span>Usable battery (kWh)</span><input type="number" id="battery" data-k="battery" step="0.5"></label>
         <label class="field"><span>Arrive with at least (%)</span><input type="number" id="reserve" data-k="reserve" step="1"></label>
         <label class="field"><span>Charge limit (%)</span><input type="number" id="maxSoc" data-k="maxSoc" step="10"></label>
@@ -595,6 +596,10 @@ function renderMonths(){
   document.getElementById("consNow").textContent=`Now: ${SEASON[k].toLowerCase()}, ${S.cons[k]} kWh/100 km.`;
 }
 
+function renderHeader(){
+  document.getElementById("hdrSub").textContent=[S.car, S.area].filter(Boolean).join(" · ");
+}
+
 function bindInputs(){
   document.querySelectorAll("[data-k]").forEach(el=>{
     const k=el.dataset.k;
@@ -608,8 +613,11 @@ function bindInputs(){
         v = LIMITS[k] ? clampSetting(k, Number(v)) : Number(v);
         el.value=v;
       }
+      if (k==="car"){ v=v.trim(); el.value=v; }
       setPath(S, k, v); saveSettings();
-      if (el.dataset.k==="area") return load();
+      if (k==="car" || k==="area") renderHeader();
+      if (k==="car") return;
+      if (k==="area") return load();
       if (el.dataset.k==="kmOneWay") renderTrips(new Date());
       if (el.dataset.k.startsWith("cons.")) renderMonths();
       recompute();
@@ -701,7 +709,7 @@ if (typeof document!=="undefined" && document.getElementById("decision")){
   });
   views();
   document.getElementById("tariffNow").textContent=`Now: ${isTariffWinter(Date.now())?"high":"low"} season.`;
-  bindInputs(); renderWeek(); renderMonths(); renderTrips(new Date()); load();
+  bindInputs(); renderHeader(); renderWeek(); renderMonths(); renderTrips(new Date()); load();
   document.addEventListener("visibilitychange",()=>{ if (document.visibilityState==="visible") load(); });
 }
 </script>
