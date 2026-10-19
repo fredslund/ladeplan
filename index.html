@@ -53,6 +53,10 @@ h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
 .setup dt{font-size:13px;color:var(--muted)}
 .setup dd{margin:0;font:600 17px var(--mono);color:var(--ink)}
 .setup .hint{margin:6px 0 0}
+.choose{display:flex;flex-direction:column;gap:10px;margin-top:12px}
+.choose[hidden]{display:none}
+.choose .row{gap:8px 14px}
+.decision .choose p{margin:0}
 .decision .rate{font-size:13.5px;padding-top:8px;border-top:1px solid var(--line);margin-top:10px}
 .decision .rate:empty{display:none}
 .rate b{font:600 11px var(--sans);text-transform:uppercase;letter-spacing:.06em;margin-right:6px;color:var(--muted)}
@@ -167,6 +171,7 @@ a.inl{color:var(--known)}
       <dl><div><dt>Charge limit</dt><dd id="sLimit"></dd></div><div><dt id="sTimerLabel">Timer</dt><dd id="sTimers"></dd></div></dl>
       <p class="hint" id="sHint"></p>
     </div>
+    <div class="choose" id="dChoose" hidden></div>
     <p class="rate" id="dRate"></p>
   </section>
 
@@ -284,7 +289,7 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, notePlanned, socEstimate, logReading, relogKm, deviates
+  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, socEstimate, logReading, relogKm, deviates
 } from "./ladeplan.js";
 
 /* ---------- storage ---------- */
@@ -349,8 +354,9 @@ function renderSocUpdate(now){
     return `<label class="field"><span>Km driven ${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}</span><input type="number" min="0" step="1" id="socKmIn" data-day="${key}" value="${kmOn(d,S)}"></label>`; };
   if (est){
     const days=est.trips.length>1 ? ` (${est.trips.length} drives, ${est.trips.map(t=>DOW[new Date(t.back).getDay()]).join(", ")})` : "";
+    const chosen = est.chosenKwh>=est.chargedKwh-0.05 ? "chosen" : est.chosenKwh>0.05 ? `${est.chosenKwh.toFixed(1)} chosen, rest assumed from the plan` : "assumed from the plan";
     box.innerHTML=`<p><b>Back home?</b> Estimated <span class="num">${est.pct}%</span></p>
-      <p class="note">${est.fromPct}%${est.chargedKwh>0.05?` + ${est.chargedKwh.toFixed(1)} kWh planned charging`:""} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). Or set the slider to what the car shows.</p>
+      <p class="note">${est.fromPct}%${est.chargedKwh>0.05?` + ${est.chargedKwh.toFixed(1)} kWh charging (${chosen})`:""} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). Or set the slider to what the car shows.</p>
       <div class="row"><button type="button" class="btn" id="socUse">Use ${est.pct}%</button><button type="button" class="linkbtn" id="socKm" aria-expanded="${KM_OPEN}">Edit km</button></div>
       <div ${KM_OPEN?"":"hidden"}>${kmField(est.trips[est.trips.length-1].key)}</div>`;
     document.getElementById("socUse").onclick=()=>{
@@ -380,6 +386,51 @@ function renderSocUpdate(now){
   }
 }
 
+// Accept or reject the proposed session. CHOOSE: which part is open (null | "reject" | "own");
+// OWN: the own-timer form values, kept across re-renders.
+let CHOOSE=null, OWN=null;
+function choose(c){ S.commit=c; CHOOSE=null; OWN=null; saveSettings(); recompute(); }
+function renderChoice(P, d, now){
+  const box=document.getElementById("dChoose");
+  if (DEMO || !(d.committed || d.choose)){ box.hidden=true; box.innerHTML=""; return; }
+  box.hidden=false;
+  if (d.committed){
+    box.innerHTML=`<div class="row"><button type="button" class="linkbtn" id="cChange">Change</button></div>`;
+    document.getElementById("cChange").onclick=()=>choose(null);
+    return;
+  }
+  const leave=P.nextDrive ? P.nextDrive.t : Infinity, sess=P.blocks.filter(b=>b.start<leave);
+  if (!OWN) OWN={ start:hm5(sess[0].start), end:hm5(sess[sess.length-1].end,true), limit:d.setup ? d.setup.limit : 80 };
+  const lim=[50,60,70,80,90,100].map(v=>`<option value="${v}"${v===OWN.limit?" selected":""}>${v}%</option>`).join("");
+  box.innerHTML=`<div class="row"><button type="button" class="btn" id="cAccept">Accept</button>
+      <button type="button" class="btn ghost" id="cReject" aria-expanded="${!!CHOOSE}">Not this</button></div>`
+    + (CHOOSE ? `<div class="row"><button type="button" class="linkbtn" id="cOwn" aria-expanded="${CHOOSE==="own"}">Set my own timer</button>
+      <button type="button" class="linkbtn" id="cNone">Don't charge</button></div>` : "")
+    + (CHOOSE==="own" ? `<div class="grid3">
+        <label class="field"><span>Start</span><input type="time" id="oStart" value="${OWN.start}"></label>
+        <label class="field"><span>End</span><input type="time" id="oEnd" value="${OWN.end}"></label>
+        <label class="field"><span>Limit</span><select id="oLimit">${lim}</select></label></div>
+      <p class="note err" id="oErr" hidden></p>
+      <div class="row"><button type="button" class="btn" id="oSave">Save</button><button type="button" class="linkbtn" id="oCancel">Cancel</button></div>` : "");
+  document.getElementById("cAccept").onclick=()=>choose(commitFrom(P, "plan", new Date()));
+  document.getElementById("cReject").onclick=()=>{ CHOOSE=CHOOSE?null:"reject"; renderChoice(P, d, now); };
+  if (!CHOOSE) return;
+  document.getElementById("cNone").onclick=()=>choose(commitFrom(P, "none", new Date()));
+  document.getElementById("cOwn").onclick=()=>{ CHOOSE=CHOOSE==="own"?"reject":"own"; renderChoice(P, d, now); if (CHOOSE==="own") document.getElementById("oStart").focus(); };
+  if (CHOOSE!=="own") return;
+  for (const [id,k] of [["oStart","start"],["oEnd","end"]]) document.getElementById(id).oninput=e=>{ OWN[k]=e.target.value; };
+  document.getElementById("oLimit").onchange=e=>{ OWN.limit=Number(e.target.value); };
+  document.getElementById("oCancel").onclick=()=>{ CHOOSE=null; OWN=null; renderChoice(P, d, now); };
+  document.getElementById("oSave").onclick=()=>{
+    const err=document.getElementById("oErr");
+    const c=OWN.start && OWN.end ? commitFrom(P, "manual", new Date(), OWN) : null;
+    if (c) return choose(c);
+    err.hidden=false;
+    err.textContent = !OWN.start || !OWN.end ? "Enter a start and an end time."
+      : `That window doesn't fall before you leave${P.nextDrive ? ` ${dayLabel(P.nextDrive.t,now).toLowerCase()} ${hhmm(P.nextDrive.t)}` : ""}.`;
+  };
+}
+
 function renderDecision(P, now){
   const d=decide(P, now, S, DATA && DATA.prices);
   document.getElementById("decision").className="card decision"+(d.cls?" "+d.cls:"");
@@ -399,6 +450,7 @@ function renderDecision(P, now){
     document.getElementById("sTimers").textContent=d.setup.timers.join(", ");
     document.getElementById("sHint").textContent=d.setup.hint;
   }
+  renderChoice(P, d, now);
 }
 
 let CHART_SEL=null;   // selected hour (ms) in the chart readout; kept across re-renders
@@ -614,7 +666,7 @@ async function load(){
   } catch(e){
     DATA=null;
     stamp.textContent="offline";
-    const box=document.getElementById("decision"); box.className="card decision bad"; document.getElementById("dLvl").textContent=""; document.getElementById("dRate").textContent=""; document.getElementById("dSetup").hidden=true;
+    const box=document.getElementById("decision"); box.className="card decision bad"; document.getElementById("dLvl").textContent=""; document.getElementById("dRate").textContent=""; document.getElementById("dSetup").hidden=true; document.getElementById("dChoose").hidden=true;
     document.getElementById("dTitle").textContent="Couldn't load prices";
     document.getElementById("dBig").textContent=String(e.message||e);
     document.getElementById("dSub").innerHTML='Check your connection and tap Refresh. The page must be opened from a normal web address. <button class="linkbtn" type="button" id="tryDemo">Show example data</button>';
@@ -626,6 +678,7 @@ if (typeof document!=="undefined" && document.getElementById("decision")){
   // Drop overrides older than today, or than the last battery reading (its drives may still need them), max 14 days
   const nowMs=Date.now(), keep=dateKey(new Date(Math.max(nowMs-14*864e5, Math.min(nowMs, S.socAt||nowMs))));
   for (const k of Object.keys(S.overrides)) if (k<keep) delete S.overrides[k];
+  if (S.commit && S.commit.until<=nowMs) S.commit=null;   // the car has left since the choice
   // Settings live on their own page at #settings, so the back gesture closes it
   const views=()=>{
     const set=location.hash==="#settings";
