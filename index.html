@@ -61,6 +61,11 @@ h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
 .soc{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px}
 .soc label{font-weight:600}
 .soc output{font:500 22px var(--mono);min-width:3.5ch;text-align:right}
+.socup{grid-column:1/-1;display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid var(--line)}
+.socup[hidden]{display:none}
+.socup p{margin:0}
+.socup .num{font:600 17px var(--mono)}
+.socup .field{max-width:12em}
 input[type=range]{width:100%;accent-color:var(--charge)}
 .hint{font-size:12.5px;color:var(--muted);margin:6px 0 0}
 .label{font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);font-weight:600;margin:0 0 8px}
@@ -149,6 +154,7 @@ a.inl{color:var(--known)}
     <label for="soc">Battery now</label>
     <input type="range" id="soc" min="0" max="100" step="1">
     <output id="socOut">–</output>
+    <div class="socup" id="socUpdate" aria-live="polite" hidden></div>
   </section>
 
   <section class="card decision" id="decision">
@@ -278,7 +284,7 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, fmtKr, pct, decide, settingsFrom
+  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, notePlanned, socEstimate, logReading, relogKm, deviates
 } from "./ladeplan.js";
 
 /* ---------- storage ---------- */
@@ -322,6 +328,57 @@ async function fetchWeather(){
 /* ---------- page state ---------- */
 const S = loadSettings();
 let DATA=null, MODEL=null, DEMO=false;
+// SOC_SET: the level as of S.socAt (S.soc follows the slider while dragging). FOLLOW: ask about the distance
+// after a reading far off the estimate. KM_OPEN: the km field under the estimate is shown.
+let SOC_SET=S.soc, FOLLOW=false, KM_OPEN=false;
+
+function setSoc(v, now){
+  S.soc=SOC_SET=v; S.socAt=now.getTime();
+  document.getElementById("soc").value=v; document.getElementById("socOut").textContent=v+"%";
+}
+function setKm(key, v){
+  const day=new Date(key+"T12:00"), pat=S.pattern[monIdx(day)]?2*S.kmOneWay:0;
+  if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
+}
+// After a drive: offer the estimated level; after a reading far off the estimate, ask about the distance.
+function renderSocUpdate(now){
+  const box=document.getElementById("socUpdate");
+  const est=socEstimate({...S, soc:SOC_SET}, now), last=S.socLog[S.socLog.length-1];
+  const refocus=document.activeElement && document.activeElement.id==="socKmIn";
+  const kmField=key=>{ const d=new Date(key+"T12:00");
+    return `<label class="field"><span>Km driven ${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}</span><input type="number" min="0" step="1" id="socKmIn" data-day="${key}" value="${kmOn(d,S)}"></label>`; };
+  if (est){
+    const days=est.trips.length>1 ? ` (${est.trips.length} drives, ${est.trips.map(t=>DOW[new Date(t.back).getDay()]).join(", ")})` : "";
+    box.innerHTML=`<p><b>Back home?</b> Estimated <span class="num">${est.pct}%</span></p>
+      <p class="note">${est.fromPct}%${est.chargedKwh>0.05?` + ${est.chargedKwh.toFixed(1)} kWh planned charging`:""} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). Or set the slider to what the car shows.</p>
+      <div class="row"><button type="button" class="btn" id="socUse">Use ${est.pct}%</button><button type="button" class="linkbtn" id="socKm" aria-expanded="${KM_OPEN}">Edit km</button></div>
+      <div ${KM_OPEN?"":"hidden"}>${kmField(est.trips[est.trips.length-1].key)}</div>`;
+    document.getElementById("socUse").onclick=()=>{
+      const t=new Date();
+      S.socLog=logReading(S.socLog, est, null, S, t); FOLLOW=KM_OPEN=false;
+      setSoc(est.pct, t); saveSettings(); recompute();
+    };
+    document.getElementById("socKm").onclick=()=>{ KM_OPEN=!KM_OPEN; renderSocUpdate(new Date()); if (KM_OPEN) document.getElementById("socKmIn").focus(); };
+  }
+  else if (FOLLOW && last){
+    const c=v=>last.km>0 ? (v/last.km*100).toFixed(1) : "–";
+    box.innerHTML=`<p>That's ≈ ${c(last.actKwh)} kWh/100 km for ${Math.round(last.km)} km; expected ${c(last.predKwh)}. Different distance?</p>
+      <div class="row">${kmField(last.date)}<button type="button" class="btn ghost" id="socOk">OK</button></div>`;
+    document.getElementById("socOk").onclick=()=>{ FOLLOW=false; renderSocUpdate(new Date()); };
+  }
+  else { box.hidden=true; box.innerHTML=""; return; }
+  box.hidden=false;
+  const km=document.getElementById("socKmIn");
+  if (km){
+    km.onchange=()=>{
+      if (km.value.trim()==="" || !isFinite(Number(km.value))) return;
+      setKm(km.dataset.day, Math.max(0, Math.round(Number(km.value))));
+      if (!est) S.socLog=relogKm(S.socLog, S);
+      saveSettings(); renderTrips(new Date()); recompute();
+    };
+    if (refocus) km.focus();
+  }
+}
 
 function renderDecision(P, now){
   const d=decide(P, now, S, DATA && DATA.prices);
@@ -509,17 +566,30 @@ function bindInputs(){
   const soc=document.getElementById("soc"), out=document.getElementById("socOut");
   soc.value=S.soc; out.textContent=S.soc+"%";
   soc.addEventListener("input",()=>{ S.soc=Number(soc.value); out.textContent=S.soc+"%"; recompute(); });
-  soc.addEventListener("change",saveSettings);
+  // A slider change is a reading of the car. After a drive it's logged against the estimate.
+  soc.addEventListener("change",()=>{
+    const now=new Date();
+    S.socLog=logReading(S.socLog, socEstimate({...S, soc:SOC_SET}, now), S.soc, S, now);
+    const last=S.socLog[S.socLog.length-1];
+    FOLLOW=!!last && last.at===now.getTime() && deviates(last, S);
+    KM_OPEN=false; setSoc(S.soc, now); saveSettings(); recompute();
+  });
   document.getElementById("reload").addEventListener("click",()=>{ DEMO=false; load(); });
   document.getElementById("demo").addEventListener("click",()=>{ DEMO=true; load(); });
 }
 
 function recompute(){
-  if (!DATA) return;
   const now=new Date();
+  renderSocUpdate(now);
+  if (!DATA) return;
   const {hours, model}=buildHours(DATA.prices, DATA.weather, S, now);
   MODEL=model;
   const P=plan(hours, S, now);
+  // Remember the charging shown, so the next estimate after a drive can assume it was done
+  if (!DEMO){
+    const pl=notePlanned(S.planned, P, now, S);
+    if (JSON.stringify(pl)!==JSON.stringify(S.planned)){ S.planned=pl; saveSettings(); }
+  }
   renderDecision(P, now); renderChart(P, now); renderTimeline(P, now);
   if (model) document.getElementById("modelInfo").textContent =
     `The forecast fits a simple model on the last three weeks (${model.n} hours): price against wind and solar forecasts for West Denmark and North Germany, temperature, hour of day and weekend. Typical error over the past week: ±${fmtKr(model.mae/1000*1.25)} kr/kWh. Forecast hours are ranked slightly pessimistically, so the plan only waits for a forecast when it is clearly cheaper.`;
@@ -553,8 +623,9 @@ async function load(){
 }
 
 if (typeof document!=="undefined" && document.getElementById("decision")){
-  // drop overrides older than today
-  const today=dateKey(new Date()); for (const k of Object.keys(S.overrides)) if (k<today) delete S.overrides[k];
+  // Drop overrides older than today, or than the last battery reading (its drives may still need them), max 14 days
+  const nowMs=Date.now(), keep=dateKey(new Date(Math.max(nowMs-14*864e5, Math.min(nowMs, S.socAt||nowMs))));
+  for (const k of Object.keys(S.overrides)) if (k<keep) delete S.overrides[k];
   // Settings live on their own page at #settings, so the back gesture closes it
   const views=()=>{
     const set=location.hash==="#settings";
