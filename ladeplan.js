@@ -14,9 +14,13 @@ const DEF = {
   t: { winter: { night: 0.08784, day: 0.2636, peak: 0.79072 },   // Oct–Mar: 10.98 / 32.95 / 98.84 øre incl. VAT
        summer: { night: 0.08784, day: 0.13176, peak: 0.34264 },  // Apr–Sep: 10.98 / 16.47 / 42.83 øre incl. VAT
        energinet: 0.14, elafgift: 0.008, supplier: 0.05 },
-  overrides: {}                        // "YYYY-MM-DD" -> round-trip km
+  overrides: {},                       // "YYYY-MM-DD" -> round-trip km
+  socAt: null,                         // ms when soc was last set
+  planned: [],                         // [start,end] ms of charging windows shown since then (assumed done)
+  socLog: []                           // readings after drives, for tuning consumption later
 };
 const STORE = "ladeplan.v1";
+const LOG_MAX = 60;
 // Allowed range per numeric setting; out-of-range values are clamped, non-numbers fall back to the default.
 const LIMITS = {
   soc:[0,100], kmOneWay:[0,500], battery:[10,200], reserve:[0,50], maxSoc:[50,100], chargerKw:[1,22], effPct:[50,100], cheapFill:[0,5], oneWindowKr:[0,50],
@@ -51,6 +55,10 @@ function settingsFrom(raw){
   let s = clone(DEF);
   try { if (raw){ const p = JSON.parse(raw); s = Object.assign(s, p); s.t = migrateTariffs(Object.assign(clone(DEF.t), p.t || {})); s.cons = Object.assign(clone(DEF.cons), p.cons || {}); delete s.kwhPer100; if (!/^[shw]{12}$/.test(s.seasons)) s.seasons = DEF.seasons; } } catch(e){}
   for (const k in LIMITS) setPath(s, k, clampSetting(k, getPath(s,k)));
+  const num=Number.isFinite;
+  if (!num(s.socAt)) s.socAt=null;
+  s.planned=Array.isArray(s.planned) ? s.planned.filter(w=>Array.isArray(w) && w.length===2 && w.every(num) && w[0]<w[1]) : [];
+  s.socLog=Array.isArray(s.socLog) ? s.socLog.filter(e=>e && num(e.at) && num(e.from) && num(e.km) && num(e.predKwh) && num(e.startKwh)).slice(-LOG_MAX) : [];
   return s;
 }
 
@@ -300,6 +308,68 @@ function plan(hours, s, now){
   return { slots, events, blocks, endLvl, B, nextDrive, mustKwh, noChargeLvl, res };
 }
 
+/* ---------- battery level after a drive ---------- */
+const DAY = 864e5;
+// Drives that ended between `from` and `to`: the whole trip if it left after `from`, half if `from` fell while
+// the car was away (same rule as drivesFor()).
+function drivesDone(s, from, to){
+  const out=[];
+  for (let day=startOfDay(new Date(from)); day.getTime()<=to; day=addDays(day,1)){
+    const km=kmOn(day, s); if (km<=0) continue;
+    const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
+    if (back<=from || back>to) continue;
+    const part=dep>from ? 1 : 0.5, cons=consFor(day, s);
+    out.push({ key:dateKey(day), back, km:km*part, cons, kwh:km*part*cons/100 });
+  }
+  return out;
+}
+// Charging windows the app has shown, kept so a later estimate can assume they were used. The part of each
+// stored window before `now` stays (back to socAt); from `now` on, the current plan's windows before the
+// next departure replace them.
+function notePlanned(planned, P, now, s){
+  const t=now.getTime(), from=Math.max(s.socAt||t, t-14*DAY), leave=P.nextDrive ? P.nextDrive.t : Infinity;
+  const past=planned.filter(([a,b])=>a<t && b>from).map(([a,b])=>[a, Math.min(b,t)]);
+  return [...past, ...P.blocks.filter(b=>b.start<leave).map(b=>[Math.round(b.start), Math.round(b.end)])];
+}
+// Battery level now, from the level set at s.socAt, plus planned charging since then, minus the drives
+// completed since then at the season's consumption. null if no drive has ended since (or socAt is unknown
+// or over two weeks old).
+function socEstimate(s, now){
+  const to=now.getTime(), from=s.socAt;
+  if (!(from>0) || from>to || to-from>14*DAY) return null;
+  const trips=drivesDone(s, from, to);
+  if (!trips.length) return null;
+  const B=s.battery, kw=s.chargerKw*s.effPct/100;
+  const chargedKwh=s.planned.reduce((a,[x,y])=>a+Math.max(0, Math.min(y,to)-Math.max(x,from))/H*kw, 0);
+  const usedKwh=trips.reduce((a,t)=>a+t.kwh,0), km=trips.reduce((a,t)=>a+t.km,0);
+  const startKwh=B*s.soc/100+chargedKwh;
+  return { from, fromPct:s.soc, chargedKwh, trips, km, usedKwh, cons:usedKwh/km*100, startKwh,
+    pct:Math.min(100, Math.max(0, Math.round((startKwh-usedKwh)/B*100))) };
+}
+const r2 = v => Math.round(v*100)/100;
+// Log a reading after a drive (actualPct null = the estimate was accepted). A change within 10 minutes of the
+// last reading with no drive ended since is a nudge of the slider: it corrects that reading instead of adding one.
+function logReading(log, est, actualPct, s, now){
+  const t=now.getTime(), last=log[log.length-1];
+  const act=start=>actualPct==null ? null : r2(start-s.battery*actualPct/100);
+  if (last && t-last.at<10*60e3 && !drivesDone(s, last.at, t).length)
+    return [...log.slice(0,-1), {...last, at:t, actKwh:act(last.startKwh)}];
+  if (!est) return log;
+  const entry={ at:t, from:est.from, date:est.trips[est.trips.length-1].key, km:r2(est.km), predKwh:r2(est.usedKwh),
+    chargedKwh:r2(est.chargedKwh), startKwh:r2(est.startKwh), actKwh:act(est.startKwh) };
+  return [...log, entry].slice(-LOG_MAX);
+}
+// After a km correction: recount the last reading's km and predicted energy (the overrides now apply).
+function relogKm(log, s){
+  const last=log[log.length-1]; if (!last) return log;
+  const trips=drivesDone(s, last.from, last.at);
+  return [...log.slice(0,-1), {...last, km:r2(trips.reduce((a,t)=>a+t.km,0)), predKwh:r2(trips.reduce((a,t)=>a+t.kwh,0))}];
+}
+// A reading far enough off the prediction to ask about the distance: 5+ points of battery and 25%+ off.
+function deviates(e, s){
+  return e.actKwh!=null && e.predKwh>0 && Math.abs(e.actKwh-e.predKwh)>=0.05*s.battery && Math.abs(e.actKwh/e.predKwh-1)>0.25;
+}
+
 /* ---------- decision card ---------- */
 const fmtKr = v => v.toFixed(2).replace(".",",");
 const pct = (kwh,B) => Math.round(kwh/B*100);
@@ -444,5 +514,5 @@ export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
   SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, priceRating, kmOn,
-  buildHours, drivesFor, plan, fmtKr, pct, decide
+  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, socEstimate, logReading, relogKm, deviates
 };

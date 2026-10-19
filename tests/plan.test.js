@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, socEstimate, logReading, relogKm, deviates } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -399,6 +399,95 @@ test("decision card rates the window against recent days", () => {
   assert.ok(cheap.rate.text.includes("beats 7 of the last 7 days") && cheap.rate.text.includes("cheapest 2 home hours"), cheap.rate.text);
   assert.strictEqual(pricey.rate.level, "pricey");
   assert.strictEqual(pricey.lvl, "Optional · cheapest ahead");
+});
+
+/* ---------- battery level after a drive ---------- */
+// Mon 19 Oct 2026 is a commute day: 07:30–17:00, 78 km, shoulder season 17 kWh/100 km = 13.26 kWh.
+const ms = iso => new Date(iso).getTime();
+function soc(at, edit) { const s = clone(DEF); s.soc = 80; s.socAt = ms(at); edit && edit(s); return s; }
+
+test("estimate subtracts a completed commute", () => {
+  const e = socEstimate(soc("2026-10-19T06:00"), new Date("2026-10-19T18:00"));
+  assert.strictEqual(e.trips.length, 1);
+  assert.strictEqual(e.km, 78);
+  assert.ok(Math.abs(e.usedKwh - 13.26) < 1e-9, e.usedKwh);
+  assert.strictEqual(e.pct, Math.round((0.8 * 58 - 13.26) / 58 * 100));   // 57
+});
+
+test("no estimate before the car is back, without socAt, or when stale", () => {
+  assert.strictEqual(socEstimate(soc("2026-10-19T06:00"), new Date("2026-10-19T16:00")), null);
+  assert.strictEqual(socEstimate(soc("2026-10-19T18:00"), new Date("2026-10-19T21:00")), null);
+  assert.strictEqual(socEstimate(soc("2026-10-19T06:00", s => { s.socAt = null; }), new Date("2026-10-19T18:00")), null);
+  assert.strictEqual(socEstimate(soc("2026-10-01T06:00"), new Date("2026-10-19T18:00")), null);
+});
+
+test("level set while away counts half the trip", () => {
+  const e = socEstimate(soc("2026-10-19T12:00"), new Date("2026-10-19T18:00"));
+  assert.strictEqual(e.km, 39);
+});
+
+test("planned charging since socAt is added, clipped to socAt and now", () => {
+  const s = soc("2026-10-18T20:00", s => { s.soc = 40; s.planned = [[ms("2026-10-18T19:00"), ms("2026-10-18T22:00")], [ms("2026-10-19T18:00"), ms("2026-10-19T20:00")]]; });
+  const e = socEstimate(s, new Date("2026-10-19T19:00"));
+  const kw = 11 * 0.9;
+  assert.ok(Math.abs(e.chargedKwh - 3 * kw) < 1e-9, e.chargedKwh);   // 2 h Sun evening + 1 h so far tonight
+  assert.strictEqual(e.pct, Math.round((0.4 * 58 + 3 * kw - 13.26) / 58 * 100));
+});
+
+test("estimate uses km overrides and spans several days, clamped at 0", () => {
+  const s = soc("2026-10-19T06:00", s => { s.overrides = { "2026-10-19": 300 }; });
+  const e = socEstimate(s, new Date("2026-10-20T18:00"));
+  assert.deepStrictEqual(e.trips.map(t => t.km), [300, 78]);
+  assert.strictEqual(e.pct, 0);
+});
+
+test("notePlanned keeps the past part and replaces the future", () => {
+  const s = soc("2026-10-19T18:00"), now = new Date("2026-10-19T21:00");
+  const old = [[ms("2026-10-19T17:00"), ms("2026-10-19T19:00")], [ms("2026-10-19T20:00"), ms("2026-10-19T23:00")], [ms("2026-10-20T01:00"), ms("2026-10-20T02:00")]];
+  const P = { nextDrive: { t: ms("2026-10-20T07:30") }, blocks: [{ start: ms("2026-10-20T02:00"), end: ms("2026-10-20T03:00") }, { start: ms("2026-10-20T19:00"), end: ms("2026-10-20T20:00") }] };
+  assert.deepStrictEqual(notePlanned(old, P, now, s), [
+    [ms("2026-10-19T17:00"), ms("2026-10-19T19:00")],
+    [ms("2026-10-19T20:00"), ms("2026-10-19T21:00")],
+    [ms("2026-10-20T02:00"), ms("2026-10-20T03:00")]]);
+});
+
+test("readings: nudges within 10 minutes edit the last entry", () => {
+  const s = soc("2026-10-19T06:00"), est = socEstimate(s, new Date("2026-10-19T18:00"));
+  let log = logReading([], est, null, s, new Date("2026-10-19T18:00"));
+  assert.strictEqual(log.length, 1);
+  assert.strictEqual(log[0].actKwh, null);
+  assert.strictEqual(log[0].date, "2026-10-19");
+  log = logReading(log, null, 50, s, new Date("2026-10-19T18:05"));
+  assert.strictEqual(log.length, 1);
+  assert.strictEqual(log[0].actKwh, Math.round((0.8 * 58 - 0.5 * 58) * 100) / 100);
+  log = logReading(log, null, 49, s, new Date("2026-10-19T18:30"));   // too late to be a nudge, no new drive
+  assert.strictEqual(log.length, 1);
+  assert.strictEqual(log[0].actKwh, Math.round((0.8 * 58 - 0.5 * 58) * 100) / 100);
+  const s2 = soc("2026-10-19T18:05", s => { s.soc = 50; });
+  const est2 = socEstimate(s2, new Date("2026-10-20T18:00"));
+  log = logReading(log, est2, 30, s2, new Date("2026-10-20T18:00"));
+  assert.strictEqual(log.length, 2);
+});
+
+test("deviation needs 5 points and 25% off; km correction recounts", () => {
+  const s = soc("2026-10-19T06:00"), est = socEstimate(s, new Date("2026-10-19T18:00"));   // predicts 13.26 kWh
+  const at = pct => logReading([], est, pct, s, new Date("2026-10-19T18:00"))[0];
+  assert.ok(!deviates(at(57), s));
+  assert.ok(!deviates(at(53), s));            // 15.6 kWh: 18% off
+  assert.ok(deviates(at(45), s));             // 20.3 kWh: 53% off, 12 points
+  assert.ok(!deviates(at(null), s));
+  s.overrides = { "2026-10-19": 120 };
+  const fixed = relogKm([at(45)], s)[0];
+  assert.strictEqual(fixed.km, 120);
+  assert.ok(!deviates(fixed, s));             // 120 km × 17 = 20.4 kWh
+});
+
+test("settingsFrom drops malformed SOC history", () => {
+  const s = stored({ socAt: "x", planned: [[2, 1], [1, 2], "a"], socLog: [{ at: 1 }, { at: 1, from: 0, km: 78, predKwh: 13, startKwh: 40 }] });
+  assert.strictEqual(s.socAt, null);
+  assert.deepStrictEqual(s.planned, [[1, 2]]);
+  assert.strictEqual(s.socLog.length, 1);
+  assert.deepStrictEqual(stored({}).planned, []);
 });
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
