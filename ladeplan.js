@@ -217,7 +217,8 @@ function drivesFor(s, now, horizonEnd){
 
 function plan(hours, s, now){
   const nowMs=now.getTime(), B=s.battery, eff=s.effPct/100;
-  const res=B*s.reserve/100, soc0=B*s.soc/100;
+  // Start from the estimate when the car has driven since the level was set (e.g. to work), else the level set
+  const est=socEstimate(s, now), res=B*s.reserve/100, soc0=est ? est.kwh : B*s.soc/100;
   const end = hours.length ? hours[hours.length-1].t+H : nowMs;
   const events=drivesFor(s, now, end).sort((a,b)=>a.t-b.t);
   // Energy that must be charged before the next departure to keep the reserve, whatever the price.
@@ -333,21 +334,23 @@ function plan(hours, s, now){
   slots.forEach((sl,i)=>{ sl.lvl=after[i]; });
   events.forEach((e,k)=>{ e.lvlBefore=before[k]; e.lvlAfter=before[k]-e.need; });
   const blocks=windows().map(w=>({ start:w.start, end:w.end, kwh:w.kwh, cost:w.cost, fc:w.fc, lvlEnd:slots[w.idx[w.idx.length-1]].lvl, hours:w.idx.length }));
-  return { slots, events, blocks, endLvl, B, nextDrive, mustKwh, noChargeLvl, res, commit };
+  return { slots, events, blocks, endLvl, B, soc0, nextDrive, mustKwh, noChargeLvl, res, commit };
 }
 
 /* ---------- battery level after a drive ---------- */
 const DAY = 864e5;
-// Drives that ended between `from` and `to`: the whole trip if it left after `from`, half if `from` fell while
-// the car was away (same rule as drivesFor()).
+// Drives between `from` and `to`, as legs: the whole trip ("day") if it left after `from` and is back by `to`;
+// half if `from` fell while the car was away ("back", same rule as drivesFor()) or the car is still away at `to`
+// ("out": the drive to work counts as done once the departure time has passed).
 function drivesDone(s, from, to){
   const out=[];
   for (let day=startOfDay(new Date(from)); day.getTime()<=to; day=addDays(day,1)){
     const km=kmOn(day, s); if (km<=0) continue;
     const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
-    if (back<=from || back>to) continue;
-    const part=dep>from ? 1 : 0.5, cons=consFor(day, s);
-    out.push({ key:dateKey(day), back, km:km*part, cons, kwh:km*part*cons/100 });
+    const leg = dep>from && back<=to ? "day" : dep<=from && back>from && back<=to ? "back" : dep>from && dep<=to && back>to ? "out" : null;
+    if (!leg) continue;
+    const part=leg==="day" ? 1 : 0.5, cons=consFor(day, s);
+    out.push({ key:dateKey(day), back, leg, km:km*part, cons, kwh:km*part*cons/100 });
   }
   return out;
 }
@@ -361,8 +364,8 @@ function notePlanned(planned, P, now, s){
   return [...past, ...P.blocks.filter(b=>b.start<leave).map(b=>[Math.round(b.start), Math.round(b.end), ...(chosen(b)?[1]:[])])];
 }
 // Battery level now, from the level set at s.socAt, plus planned charging since then, minus the drives
-// completed since then at the season's consumption. null if no drive has ended since (or socAt is unknown
-// or over two weeks old).
+// (legs, see drivesDone()) since then at the season's consumption. null if no drive was made since (or socAt is
+// unknown or over two weeks old). plan() starts from this estimate when there is one.
 function socEstimate(s, now){
   const to=now.getTime(), from=s.socAt;
   if (!(from>0) || from>to || to-from>14*DAY) return null;
@@ -373,8 +376,8 @@ function socEstimate(s, now){
   const chargedKwh=s.planned.reduce((a,w)=>a+kwhIn(w), 0), chosenKwh=s.planned.reduce((a,w)=>a+(w[2] ? kwhIn(w) : 0), 0);
   const usedKwh=trips.reduce((a,t)=>a+t.kwh,0), km=trips.reduce((a,t)=>a+t.km,0);
   const startKwh=B*s.soc/100+chargedKwh;
-  return { from, fromPct:s.soc, chargedKwh, chosenKwh, trips, km, usedKwh, cons:usedKwh/km*100, startKwh,
-    pct:Math.min(100, Math.max(0, Math.round((startKwh-usedKwh)/B*100))) };
+  const kwh=Math.min(B, Math.max(0, startKwh-usedKwh));
+  return { from, fromPct:s.soc, chargedKwh, chosenKwh, trips, km, usedKwh, cons:usedKwh/km*100, startKwh, kwh, pct:Math.round(kwh/B*100) };
 }
 const r2 = v => Math.round(v*100)/100;
 // Log a reading after a drive (actualPct null = the estimate was accepted). A change within 10 minutes of the
@@ -385,7 +388,8 @@ function logReading(log, est, actualPct, s, now){
   if (last && t-last.at<10*60e3 && !drivesDone(s, last.at, t).length)
     return [...log.slice(0,-1), {...last, at:t, actKwh:act(last.startKwh)}];
   if (!est) return log;
-  const entry={ at:t, from:est.from, date:est.trips[est.trips.length-1].key, km:r2(est.km), predKwh:r2(est.usedKwh),
+  const legs=est.trips.map(x=>x.leg), leg=legs.every(l=>l==="day") ? "day" : legs.length===1 ? legs[0] : "mixed";
+  const entry={ at:t, from:est.from, date:est.trips[est.trips.length-1].key, leg, km:r2(est.km), predKwh:r2(est.usedKwh),
     chargedKwh:r2(est.chargedKwh), startKwh:r2(est.startKwh), actKwh:act(est.startKwh) };
   return [...log, entry].slice(-LOG_MAX);
 }
@@ -396,8 +400,9 @@ function relogKm(log, s){
   return [...log.slice(0,-1), {...last, km:r2(trips.reduce((a,t)=>a+t.km,0)), predKwh:r2(trips.reduce((a,t)=>a+t.kwh,0))}];
 }
 // A reading far enough off the prediction to ask about the distance: 5+ points of battery and 25%+ off.
+// Not for a single drive to or from work: on half a trip, rounding and morning/evening differences dominate.
 function deviates(e, s){
-  return e.actKwh!=null && e.predKwh>0 && Math.abs(e.actKwh-e.predKwh)>=0.05*s.battery && Math.abs(e.actKwh/e.predKwh-1)>0.25;
+  return e.leg!=="out" && e.leg!=="back" && e.actKwh!=null && e.predKwh>0 && Math.abs(e.actKwh-e.predKwh)>=0.05*s.battery && Math.abs(e.actKwh/e.predKwh-1)>0.25;
 }
 
 /* ---------- decision card ---------- */
@@ -577,7 +582,7 @@ function committed(P, now, s, short, nextDrive, day, when){
   const home = nextDrive ? `You get home from ${day(nextDrive.t)}'s drive with ${pct(nextDrive.lvlAfter,P.B)}%.` : "";
   const leave = nextDrive ? ` before you leave ${day(nextDrive.t)} ${hhmm(nextDrive.t)}` : "";
   if (c.kind==="none") return { ...base, cls:"ok", title:`No charging${leave}`,
-    big: nextDrive ? `Leave with ${pct(nextDrive.lvlBefore,P.B)}%` : `Battery stays at ${s.soc}%`, sub:home };
+    big: nextDrive ? `Leave with ${pct(nextDrive.lvlBefore,P.B)}%` : `Battery stays at ${pct(P.soc0,P.B)}%`, sub:home };
   const chosen=P.blocks.filter(b=>b.start<c.until);
   const timers=c.windows.filter(w=>w[1]>now.getTime()).map(([a,b])=>`${a<=now.getTime()+60e3?"now":hm5(a)}–${hm5(b,true)}`);
   const setup={ limit:c.limit, timers, hint:"" };

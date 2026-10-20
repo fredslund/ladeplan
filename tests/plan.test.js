@@ -414,8 +414,9 @@ test("estimate subtracts a completed commute", () => {
   assert.strictEqual(e.pct, Math.round((0.8 * 58 - 13.26) / 58 * 100));   // 57
 });
 
-test("no estimate before the car is back, without socAt, or when stale", () => {
-  assert.strictEqual(socEstimate(soc("2026-10-19T06:00"), new Date("2026-10-19T16:00")), null);
+test("no estimate before the car leaves, without socAt, or when stale", () => {
+  assert.strictEqual(socEstimate(soc("2026-10-19T06:00"), new Date("2026-10-19T07:00")), null);
+  assert.strictEqual(socEstimate(soc("2026-10-19T12:00"), new Date("2026-10-19T16:00")), null);
   assert.strictEqual(socEstimate(soc("2026-10-19T18:00"), new Date("2026-10-19T21:00")), null);
   assert.strictEqual(socEstimate(soc("2026-10-19T06:00", s => { s.socAt = null; }), new Date("2026-10-19T18:00")), null);
   assert.strictEqual(socEstimate(soc("2026-10-01T06:00"), new Date("2026-10-19T18:00")), null);
@@ -424,6 +425,46 @@ test("no estimate before the car is back, without socAt, or when stale", () => {
 test("level set while away counts half the trip", () => {
   const e = socEstimate(soc("2026-10-19T12:00"), new Date("2026-10-19T18:00"));
   assert.strictEqual(e.km, 39);
+  assert.strictEqual(e.trips[0].leg, "back");
+});
+
+test("while away, the drive to work counts as done", () => {
+  const e = socEstimate(soc("2026-10-19T06:00"), new Date("2026-10-19T12:00"));
+  assert.deepStrictEqual(e.trips.map(t => [t.leg, t.km]), [["out", 39]]);
+  assert.strictEqual(e.pct, Math.round((0.8 * 58 - 6.63) / 58 * 100));
+});
+
+test("plan starts from the estimate: the drive to work is subtracted", () => {
+  const now = new Date("2026-10-19T12:00"), d = demoData(now);
+  const s = soc("2026-10-18T21:00", s => { s.soc = 30; });
+  const { hours } = buildHours(d.prices, d.weather, s, now);
+  const P = plan(hours, s, now), back = P.events.find(e => e.returning);
+  assert.ok(Math.abs(P.soc0 - (0.3 * 58 - 6.63)) < 1e-9, P.soc0);
+  assert.ok(Math.abs(back.lvlBefore - P.soc0) < 1e-9);
+  assert.strictEqual(back.need, 6.63);   // only the drive home is still ahead
+  // level set at work: nothing driven since, so plan from it
+  const s2 = soc("2026-10-19T11:00", s => { s.soc = 30; });
+  assert.strictEqual(plan(hours, s2, now).soc0, 0.3 * 58);
+  // set at home after the drive: the whole day is subtracted until the level is updated
+  const eve = new Date("2026-10-19T19:00"), d2 = demoData(eve), h2 = buildHours(d2.prices, d2.weather, s, eve).hours;
+  assert.ok(Math.abs(plan(h2, s, eve).soc0 - (0.3 * 58 - 13.26)) < 1e-9);
+});
+
+test("a reading at work and one at home log the two drives", () => {
+  const s = soc("2026-10-19T06:00"), noon = new Date("2026-10-19T12:00");
+  let log = logReading([], socEstimate(s, noon), 70, s, noon);
+  assert.strictEqual(log[0].leg, "out");
+  assert.strictEqual(log[0].km, 39);
+  const s2 = soc("2026-10-19T12:00", s => { s.soc = 70; }), eve = new Date("2026-10-19T19:00");
+  log = logReading(log, socEstimate(s2, eve), 64, s2, eve);
+  assert.strictEqual(log.length, 2);
+  assert.deepStrictEqual([log[1].leg, log[1].km, log[1].predKwh, log[1].actKwh], ["back", 39, 6.63, 3.48]);
+  assert.ok(!deviates(log[1], s2));   // 3.5 vs 6.6 kWh on one drive is noise, not a wrong distance
+  assert.ok(deviates({ ...log[1], leg: "day" }, s2));
+  // km correction (whole day 100 km) recounts the drive home as half of it, not halved twice
+  s2.overrides = { "2026-10-19": 100 };
+  const fixed = relogKm(log, s2)[1];
+  assert.deepStrictEqual([fixed.km, fixed.predKwh], [50, 8.5]);
 });
 
 test("planned charging since socAt is added, clipped to socAt and now", () => {
