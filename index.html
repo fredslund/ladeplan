@@ -290,7 +290,7 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, socEstimate, logReading, relogKm, deviates
+  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, socEstimate, logReading, relogKm, deviates, levelEst
 } from "./ladeplan.js";
 
 /* ---------- storage ---------- */
@@ -347,23 +347,24 @@ function setKm(key, v){
   if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
 }
 // After a drive (or once the car has left for work): offer the estimated level, which the plan already uses;
-// after a reading far off the estimate, ask about the distance.
+// after a reading far off the estimate, ask about the distance; after planned charging, show the level it assumes.
 function renderSocUpdate(now){
   const box=document.getElementById("socUpdate");
-  const est=socEstimate({...S, soc:SOC_SET}, now), last=S.socLog[S.socLog.length-1];
+  const lv=levelEst({...S, soc:SOC_SET}, now), est=lv && lv.trips.length ? lv : null, last=S.socLog[S.socLog.length-1];
   const refocus=document.activeElement && document.activeElement.id==="socKmIn";
   // The field always edits the whole day's km; say so when only one drive of it is counted
   const kmField=(key, half)=>{ const d=new Date(key+"T12:00");
     return `<label class="field"><span>Km driven ${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}${half?" (round trip)":""}</span><input type="number" min="0" step="1" id="socKmIn" data-day="${key}" value="${kmOn(d,S)}"></label>`; };
+  const set=from=>dateKey(new Date(from))===dateKey(now) ? hhmm(from) : `${DOW[new Date(from).getDay()]} ${hhmm(from)}`;
+  const charged=e=>e.chargedKwh>0.05 ? ` + ${e.chargedKwh.toFixed(1)} kWh charging (${e.chosenKwh>=e.chargedKwh-0.05 ? "chosen" : e.chosenKwh>0.05 ? `${e.chosenKwh.toFixed(1)} chosen, rest assumed from the plan` : "assumed from the plan"})` : "";
+  const useBtn=(e, extra="")=>`<div class="row"><button type="button" class="btn" id="socUse">Use ${e.pct}%</button>${extra}</div>`;
   if (est){
     const lastTrip=est.trips[est.trips.length-1], half=lastTrip.leg!=="day";
     const days=est.trips.length>1 ? ` (${est.trips.length} drives, ${est.trips.map(t=>DOW[new Date(t.back).getDay()]).join(", ")})`
       : lastTrip.leg==="out" ? " drive to work" : lastTrip.leg==="back" ? " drive home" : "";
-    const set=dateKey(new Date(est.from))===dateKey(now) ? hhmm(est.from) : `${DOW[new Date(est.from).getDay()]} ${hhmm(est.from)}`;
-    const chosen = est.chosenKwh>=est.chargedKwh-0.05 ? "chosen" : est.chosenKwh>0.05 ? `${est.chosenKwh.toFixed(1)} chosen, rest assumed from the plan` : "assumed from the plan";
     box.innerHTML=`<p><b>${lastTrip.leg==="out"?"At work?":"Back home?"}</b> Estimated <span class="num">${est.pct}%</span></p>
-      <p class="note">${est.fromPct}% (${set})${est.chargedKwh>0.05?` + ${est.chargedKwh.toFixed(1)} kWh charging (${chosen})`:""} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). The plan uses this; or set the slider to what the car shows.</p>
-      <div class="row"><button type="button" class="btn" id="socUse">Use ${est.pct}%</button><button type="button" class="linkbtn" id="socKm" aria-expanded="${KM_OPEN}">Edit km</button></div>
+      <p class="note">${est.fromPct}% (${set(est.from)})${charged(est)} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). The plan uses this; or set the slider to what the car shows.</p>
+      ${useBtn(est, `<button type="button" class="linkbtn" id="socKm" aria-expanded="${KM_OPEN}">Edit km</button>`)}
       <div ${KM_OPEN?"":"hidden"}>${kmField(lastTrip.key, half)}</div>`;
     document.getElementById("socUse").onclick=()=>{
       const t=new Date();
@@ -377,6 +378,14 @@ function renderSocUpdate(now){
     box.innerHTML=`<p>That's ≈ ${c(last.actKwh)} kWh/100 km for ${Math.round(last.km)} km; expected ${c(last.predKwh)}. Different distance?</p>
       <div class="row">${kmField(last.date)}<button type="button" class="btn ghost" id="socOk">OK</button></div>`;
     document.getElementById("socOk").onclick=()=>{ FOLLOW=false; renderSocUpdate(new Date()); };
+  }
+  else if (lv && lv.chargedKwh>0.05){
+    // No drive since, but planned charging: the plan assumes it ran, so show it (and catch a session that didn't)
+    const t=now.getTime(), running=S.planned.some(([a,b])=>a<=t && b>t);
+    box.innerHTML=`<p><b>${running?"Charging":"Charged?"}</b> Estimated <span class="num">${lv.pct}%</span>${running?" so far":""}</p>
+      <p class="note">${lv.fromPct}% (${set(lv.from)})${charged(lv)}. The plan uses this; or set the slider to what the car shows.</p>
+      ${useBtn(lv)}`;
+    document.getElementById("socUse").onclick=()=>{ FOLLOW=KM_OPEN=false; setSoc(lv.pct, new Date()); saveSettings(); recompute(); };
   }
   else { box.hidden=true; box.innerHTML=""; return; }
   box.hidden=false;
