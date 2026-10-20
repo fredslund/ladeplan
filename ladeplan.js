@@ -413,8 +413,15 @@ function logReading(log, est, actualPct, s, now){
   if (!est) return log;
   const legs=est.trips.map(x=>x.leg), leg=legs.every(l=>l==="day") ? "day" : legs.length===1 ? legs[0] : "mixed";
   const entry={ at:t, from:est.from, date:est.trips[est.trips.length-1].key, leg, km:r2(est.km), predKwh:r2(est.usedKwh),
-    chargedKwh:r2(est.chargedKwh), startKwh:r2(est.startKwh), actKwh:act(est.startKwh) };
+    chargedKwh:r2(est.chargedKwh), chosenKwh:r2(est.chosenKwh), startKwh:r2(est.startKwh), actKwh:act(est.startKwh) };
   return [...log, entry].slice(-LOG_MAX);
+}
+// Whether a log entry can teach consumption: a reading, not explained by charging (cause, see explainReading()),
+// and a plausible consumption (8–35 kWh/100 km), so a missed or unknown charge doesn't count as driving.
+function usableReading(e){
+  if (e.actKwh==null || e.cause==="charging" || !(e.km>0)) return false;
+  const c=e.actKwh/e.km*100;
+  return c>=8 && c<=35;
 }
 // After a km correction: recount the last reading's km and predicted energy (the overrides now apply).
 function relogKm(log, s){
@@ -433,7 +440,9 @@ function deviates(e, s){
 // weekly pattern doesn't rewrite past days). Entries, sorted by `at` (ms), kept HIST_DAYS:
 //   drive   { at: back, dep, date, km, kwh, cons, src: schedule|override }  the day's round trip, once it has ended
 //   charge  { at: start, end, kwh, chosen }  a charging window the app showed (assumed) or the user chose
-//   reading { at, pct, estPct, diffKwh }     a level set from the car, vs. the estimate then (diff = car − estimate)
+//   drive   { …, dep: null, src: errand }   an errand told with a reading (addErrand())
+//   reading { at, pct, estPct, diffKwh, chargedKwh, cause? }  a level set from the car, vs. the estimate then
+//           (diff = car − estimate), with the charging assumed since the previous reading
 //   level   { at, pct, how: use|roll }       the estimate taken as the level ("Use", or moved forward by rollLevel())
 const histSort = (h, t) => h.filter(e=>e.at>=t-HIST_DAYS*DAY).sort((a,b)=>a.at-b.at);
 function driveEntry(day, s){
@@ -454,7 +463,7 @@ function recordHistory(s, now){
   from=Math.max(from, t-HIST_DAYS*DAY);
   for (let day=startOfDay(new Date(from)); day.getTime()<=t; day=addDays(day,1)){
     const back=atTime(day,s.home).getTime(), key=dateKey(day);
-    if (kmOn(day,s)<=0 || back<=from || back>t || hist.some(h=>h.k==="drive" && h.date===key)) continue;
+    if (kmOn(day,s)<=0 || back<=from || back>t || hist.some(h=>h.k==="drive" && h.date===key && h.src!=="errand")) continue;
     hist.push(driveEntry(day, s));
   }
   // The plan re-clips a running window on every recompute, so `planned` holds it in pieces: join touching ones
@@ -469,28 +478,52 @@ function recordHistory(s, now){
   }
   return { history:histSort(hist, t), histAt:t };
 }
-// A level set from the car, against the estimate before it (est from levelEst(), or null). A change within 10
-// minutes of the last entry, if that is a reading, corrects it (like logReading()).
-function addReading(history, est, pct, B, now){
+// A level set from the car, against the estimate before it (est from levelEst(), or null), with the charging
+// assumed since the previous reading (chargedKwh). A change within 10 minutes of the last entry, if that is a
+// reading, corrects it (like logReading()) and keeps its estimate and charging.
+function addReading(history, est, pct, B, now, chargedKwh=0){
   const t=now.getTime(), last=history[history.length-1];
   if (last && last.k==="reading" && t-last.at<10*60e3)
     return [...history.slice(0,-1), {...last, at:t, pct, diffKwh:last.estPct==null ? null : r2(B*(pct-last.estPct)/100)}];
-  return histSort([...history, { k:"reading", at:t, pct, estPct:est ? r2(est.kwh/B*100) : null, diffKwh:est ? r2(B*pct/100-est.kwh) : null }], t);
+  return histSort([...history, { k:"reading", at:t, pct, estPct:est ? r2(est.kwh/B*100) : null, diffKwh:est ? r2(B*pct/100-est.kwh) : null,
+    chargedKwh:r2(chargedKwh) }], t);
 }
 function addLevel(history, pct, how, now){
   return histSort([...history, { k:"level", at:now.getTime(), pct:r2(pct), how }], now.getTime());
 }
+// Ask about a reading (history entry from addReading()) far off the estimate: "low" (car below it) or "high",
+// else null. Needs 5+ points; when the interval had a drive (logged, a socLog entry), also deviates().
+function readingQuestion(reading, logged, s){
+  if (!reading || reading.diffKwh==null || Math.abs(reading.diffKwh)<0.05*s.battery) return null;
+  if (logged && !deviates(logged, s)) return null;
+  return reading.diffKwh<0 ? "low" : "high";
+}
+const LOG_CAUSE = { drove:"km", "charging-short":"charging", "charged-elsewhere":"charging", ok:"ok" };
+// The user's answer for the reading at `at`: drove (distance corrected), charging-short (planned charging didn't
+// run fully), charged-elsewhere or ok (just off). Kept on the history reading and the socLog entry (if any).
+function explainReading(history, log, at, cause){
+  return { history:history.map(e=>e.k==="reading" && e.at===at ? {...e, cause} : e),
+    socLog:log.map(e=>e.at===at ? {...e, cause:LOG_CAUSE[cause]} : e) };
+}
+// An errand on a day without a commute, told with a reading at `at`: a drive in the history only (the reading
+// already set the level, so the plan doesn't need it). Just before the reading, so it sorts first; replaces an
+// errand told within the 10 minutes before (the reading may have been nudged since). 0 km removes it.
+function addErrand(history, km, s, at){
+  const day=new Date(at), cons=consFor(day, s), t=at-1;
+  const rest=history.filter(e=>!(e.k==="drive" && e.src==="errand" && e.at<at && e.at>at-10*60e3));
+  return km>0 ? histSort([...rest, { k:"drive", at:t, dep:null, date:dateKey(day), km, kwh:r2(km*cons/100), cons, src:"errand" }], at) : rest;
+}
 // After a km correction for a day: its drive entry (if recorded) takes the new distance.
 function correctDrive(history, key, s){
-  return history.map(e=>e.k==="drive" && e.date===key ? {...driveEntry(new Date(key+"T12:00"), s), at:e.at, dep:e.dep} : e);
+  return history.map(e=>e.k==="drive" && e.date===key && e.src!=="errand" ? {...driveEntry(new Date(key+"T12:00"), s), at:e.at, dep:e.dep} : e);
 }
 // One row per entry, for checking in a spreadsheet.
 function historyCsv(history){
   const ts=t=>`${dateKey(new Date(t))} ${hhmm(t)}`;
   const v=x=>{ const q=x==null ? "" : String(x); return /[",\n]/.test(q) ? `"${q.replace(/"/g,'""')}"` : q; };
-  const rows=history.map(e=>e.k==="drive" ? [ts(e.dep), ts(e.at), "drive", e.km, -e.kwh, "", "", `${e.cons} kWh/100 km, ${e.src}`]
+  const rows=history.map(e=>e.k==="drive" ? [ts(e.dep||e.at), e.dep ? ts(e.at) : "", "drive", e.km, -e.kwh, "", "", `${e.cons} kWh/100 km, ${e.src}`]
     : e.k==="charge" ? [ts(e.at), ts(e.end), "charge", "", e.kwh, "", "", e.chosen ? "chosen" : "assumed"]
-    : e.k==="reading" ? [ts(e.at), "", "reading", "", e.diffKwh, e.pct, e.estPct, ""]
+    : e.k==="reading" ? [ts(e.at), "", "reading", "", e.diffKwh, e.pct, e.estPct, e.cause||""]
     : [ts(e.at), "", "level", "", "", e.pct, "", e.how]);
   return [["start","end","type","km","kwh","pct","est_pct","note"], ...rows].map(r=>r.map(v).join(",")).join("\n");
 }
@@ -689,5 +722,5 @@ export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
   SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, priceRating, kmOn,
-  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, limitFor, commitFrom
+  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom
 };
