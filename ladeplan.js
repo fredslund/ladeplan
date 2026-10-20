@@ -16,7 +16,8 @@ const DEF = {
        summer: { night: 0.08784, day: 0.13176, peak: 0.34264 },  // Apr–Sep: 10.98 / 16.47 / 42.83 øre incl. VAT
        energinet: 0.14, elafgift: 0.008, supplier: 0.05 },
   overrides: {},                       // "YYYY-MM-DD" -> round-trip km
-  socAt: null,                         // ms when soc was last set
+  socAt: null,                         // ms when soc was last set (by a reading, "Use" or moved forward by rollLevel())
+  readAt: null, readSoc: null,         // the last reading of the car (slider moved), for the consumption log
   planned: [],                         // [start,end] ms of charging windows shown since then (assumed done)
   socLog: [],                          // readings after drives, for tuning consumption later
   commit: null                         // session choice: { kind: plan|manual|none, until, windows, limit, at }
@@ -62,6 +63,9 @@ function settingsFrom(raw){
   if (!["DK1","DK2"].includes(s.area)) s.area = DEF.area;
   const num=Number.isFinite;
   if (!num(s.socAt)) s.socAt=null;
+  // Before readAt existed, every level set counted as a reading
+  if (!num(s.readAt) || !num(s.readSoc)){ s.readAt=s.socAt; s.readSoc=s.socAt==null ? null : s.soc; }
+  else s.readSoc=Math.min(100, Math.max(0, s.readSoc));
   const win=w=>Array.isArray(w) && num(w[0]) && num(w[1]) && w[0]<w[1];
   s.planned=Array.isArray(s.planned) ? s.planned.filter(w=>win(w) && (w.length===2 || (w.length===3 && w[2]===1))) : [];
   const c=s.commit;
@@ -355,20 +359,20 @@ function drivesDone(s, from, to){
   return out;
 }
 // Charging windows the app has shown, kept so a later estimate can assume they were used. The part of each
-// stored window before `now` stays (back to socAt); from `now` on, the current plan's windows before the
+// stored window before `now` stays (back to socAt or the last reading, max 14 days); from `now` on, the current plan's windows before the
 // next departure replace them. Windows the user chose (P.commit) are marked with a third element 1.
 function notePlanned(planned, P, now, s){
-  const t=now.getTime(), from=Math.max(s.socAt||t, t-14*DAY), leave=P.nextDrive ? P.nextDrive.t : Infinity;
+  const t=now.getTime(), from=Math.max(Math.min(s.socAt||t, s.readAt||t), t-14*DAY), leave=P.nextDrive ? P.nextDrive.t : Infinity;
   const past=planned.filter(([a,b])=>a<t && b>from).map(([a,b,c])=>c ? [a, Math.min(b,t), 1] : [a, Math.min(b,t)]);
   const chosen=b=>P.commit && b.start<P.commit.until;
   return [...past, ...P.blocks.filter(b=>b.start<leave).map(b=>[Math.round(b.start), Math.round(b.end), ...(chosen(b)?[1]:[])])];
 }
 // Battery level now, from the level set at s.socAt, plus planned charging since then (assumes the plan was
 // followed), minus the drives (legs, see drivesDone()) since then at the season's consumption. null if socAt
-// is unknown or over two weeks old. plan() starts from this.
+// is unknown. plan() starts from this; rollLevel() keeps socAt recent, so it never runs out.
 function levelEst(s, now){
   const to=now.getTime(), from=s.socAt;
-  if (!(from>0) || from>to || to-from>14*DAY) return null;
+  if (!(from>0) || from>to) return null;
   const trips=drivesDone(s, from, to);
   const B=s.battery, kw=s.chargerKw*s.effPct/100;
   const kwhIn=w=>Math.max(0, Math.min(w[1],to)-Math.max(w[0],from))/H*kw;
@@ -376,10 +380,23 @@ function levelEst(s, now){
   const usedKwh=trips.reduce((a,t)=>a+t.kwh,0), km=trips.reduce((a,t)=>a+t.km,0);
   const startKwh=B*s.soc/100+chargedKwh;
   const kwh=Math.min(B, Math.max(0, startKwh-usedKwh));
-  return { from, fromPct:s.soc, chargedKwh, chosenKwh, trips, km, usedKwh, cons:km ? usedKwh/km*100 : null, startKwh, kwh, pct:Math.round(kwh/B*100) };
+  return { from, fromPct:s.soc, B, chargedKwh, chosenKwh, trips, km, usedKwh, cons:km ? usedKwh/km*100 : null, startKwh, kwh, pct:Math.round(kwh/B*100) };
 }
 // The estimate to offer as a reading after a drive: null if no drive was made since the level was set.
 function socEstimate(s, now){ const e=levelEst(s, now); return e && e.trips.length ? e : null; }
+// The estimate since the last reading of the car, which a new reading is logged against (so a level moved forward
+// in between doesn't split the interval). null without a drive since, or if that reading is over two weeks old.
+function readingEst(s, now){
+  if (!(s.readAt>0) || now.getTime()-s.readAt>14*DAY) return null;
+  return socEstimate({...s, soc:s.readSoc, socAt:s.readAt}, now);
+}
+// Once the level is a day old, replace it with the estimate (unrounded, not a reading), so it never goes stale
+// and the stored windows and km overrides it needs stay short. null if nothing to do.
+function rollLevel(s, now){
+  if (!(s.socAt>0) || now.getTime()-s.socAt<DAY) return null;
+  const e=levelEst(s, now);
+  return e ? { soc:Math.round(e.kwh/s.battery*1e4)/100, socAt:now.getTime() } : null;
+}
 const r2 = v => Math.round(v*100)/100;
 // Log a reading after a drive (actualPct null = the estimate was accepted). A change within 10 minutes of the
 // last reading with no drive ended since is a nudge of the slider: it corrects that reading instead of adding one.
@@ -600,5 +617,5 @@ export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
   SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, priceRating, kmOn,
-  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, logReading, relogKm, deviates, limitFor, commitFrom
+  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, logReading, relogKm, deviates, limitFor, commitFrom
 };

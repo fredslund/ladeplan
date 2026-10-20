@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -414,12 +414,11 @@ test("estimate subtracts a completed commute", () => {
   assert.strictEqual(e.pct, Math.round((0.8 * 58 - 13.26) / 58 * 100));   // 57
 });
 
-test("no estimate before the car leaves, without socAt, or when stale", () => {
+test("no estimate before the car leaves or without socAt", () => {
   assert.strictEqual(socEstimate(soc("2026-10-19T06:00"), new Date("2026-10-19T07:00")), null);
   assert.strictEqual(socEstimate(soc("2026-10-19T12:00"), new Date("2026-10-19T16:00")), null);
   assert.strictEqual(socEstimate(soc("2026-10-19T18:00"), new Date("2026-10-19T21:00")), null);
   assert.strictEqual(socEstimate(soc("2026-10-19T06:00", s => { s.socAt = null; }), new Date("2026-10-19T18:00")), null);
-  assert.strictEqual(socEstimate(soc("2026-10-01T06:00"), new Date("2026-10-19T18:00")), null);
 });
 
 test("level set while away counts half the trip", () => {
@@ -481,6 +480,54 @@ test("with Don't charge chosen, the level stays as set", () => {
   assert.deepStrictEqual(s.planned.filter(w => w[0] < ms("2026-10-20T07:30")), []);
   const morn = new Date("2026-10-20T06:00"), d2 = demoData(morn);
   assert.ok(Math.abs(plan(buildHours(d2.prices, d2.weather, s, morn).hours, s, morn).soc0 - 0.2 * 58) < 1e-9);
+});
+
+/* ---------- level moved forward (no reading needed) ---------- */
+test("old settings: the level set counts as the last reading", () => {
+  const s = settingsFrom(JSON.stringify({ soc: 62, socAt: ms("2026-10-19T06:00") }));
+  assert.deepStrictEqual([s.readAt, s.readSoc], [ms("2026-10-19T06:00"), 62]);
+  assert.deepStrictEqual([settingsFrom(null).readAt, settingsFrom(null).readSoc], [null, null]);
+  const kept = settingsFrom(JSON.stringify({ soc: 55.25, socAt: ms("2026-10-20T06:00"), readAt: ms("2026-10-19T06:00"), readSoc: 140 }));
+  assert.deepStrictEqual([kept.soc, kept.readAt, kept.readSoc], [55.25, ms("2026-10-19T06:00"), 100]);
+});
+
+test("rollLevel moves a day-old level forward without changing the estimate", () => {
+  const s = soc("2026-10-19T06:00");
+  assert.strictEqual(rollLevel(s, new Date("2026-10-20T05:00")), null);   // under a day
+  const now = new Date("2026-10-20T06:00"), r = rollLevel(s, now), e = levelEst(s, now);
+  assert.strictEqual(r.socAt, now.getTime());
+  assert.ok(Math.abs(r.soc - e.kwh / 58 * 100) < 0.01 && r.soc !== Math.round(r.soc), r.soc);   // unrounded
+  const s2 = { ...s, ...r }, later = new Date("2026-10-20T19:00");
+  assert.ok(Math.abs(levelEst(s2, later).kwh - levelEst(s, later).kwh) < 0.01);
+});
+
+test("no reading for 20 days: the plan follows the estimate, no jump after two weeks", () => {
+  let s = soc("2026-10-01T21:00", s => { s.soc = 90; s.overrides = {}; });
+  s.readAt = s.socAt; s.readSoc = 90;
+  let prev = null;
+  for (let i = 1; i <= 20; i++) {
+    const now = new Date(ms("2026-10-01T21:00") + i * 864e5), d = demoData(now);
+    const r = rollLevel(s, now); if (r) s = { ...s, ...r };
+    const { hours } = buildHours(d.prices, d.weather, s, now), P = plan(hours, s, now);
+    s.planned = notePlanned(s.planned, P, now, s);
+    assert.ok(P.soc0 > 58 * 0.1 - 1e-6, `day ${i}: ${P.soc0}`);   // charging keeps it above the reserve
+    if (prev != null) assert.ok(Math.abs(P.soc0 - prev) < 30, `day ${i}: ${prev} → ${P.soc0}`);
+    prev = P.soc0;
+    assert.ok(s.planned.every(w => w[1] > now - 14 * 864e5), "windows kept at most 14 days");
+  }
+  assert.strictEqual(s.readAt, ms("2026-10-01T21:00"));   // never a reading
+  assert.strictEqual(readingEst(s, new Date("2026-10-21T21:00")), null);   // too old to log against
+});
+
+test("a reading is logged from the last reading, across a level moved forward", () => {
+  const s = soc("2026-10-19T06:00"); s.readAt = s.socAt; s.readSoc = 80;
+  const r = rollLevel(s, new Date("2026-10-20T06:00")); Object.assign(s, r);   // Mon's drive is before the new socAt
+  const eve = new Date("2026-10-20T18:00"), e = readingEst(s, eve);
+  assert.deepStrictEqual(e.trips.map(t => t.key), ["2026-10-19", "2026-10-20"]);
+  assert.strictEqual(e.from, s.readAt);
+  assert.deepStrictEqual(socEstimate(s, eve).trips.map(t => t.key), ["2026-10-20"]);
+  const log = logReading([], e, 30, s, eve);
+  assert.deepStrictEqual([log[0].km, log[0].leg], [156, "day"]);
 });
 
 test("a reading at work and one at home log the two drives", () => {
