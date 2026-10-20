@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -780,6 +780,78 @@ test("history CSV has one row per entry", () => {
     "2026-10-19 01:00,2026-10-19 02:00,charge,,9.9,,,chosen",
     "2026-10-19 07:30,2026-10-19 17:00,drive,78,-13.26,,,\"17 kWh/100 km, schedule\"",
     "2026-10-19 19:00,,reading,,,61,,"]);
+});
+
+/* ---------- explaining readings far off the estimate ---------- */
+// The reading's history entry and socLog entry (if a drive was in between), as the slider handler makes them
+function readAt(s, at, pct) {
+  const now = new Date(at), log = logReading(s.socLog || [], readingEst(s, now), pct, s, now);
+  const since = levelEst({ ...s, soc: s.readSoc, socAt: s.readAt }, now);
+  const history = addReading(s.history || [], levelEst(s, now), pct, s.battery, now, since ? since.chargedKwh : 0);
+  const last = log[log.length - 1], logged = last && last.at === now.getTime() ? last : null;
+  return { log, history, logged, reading: history[history.length - 1], q: readingQuestion(history[history.length - 1], logged, s) };
+}
+
+test("below the estimate after an assumed night charge: asks, and the answer is kept", () => {
+  const s = hist("2026-10-19T21:00", s => { s.soc = 20; s.readSoc = 20; s.planned = [[ms("2026-10-20T01:00"), ms("2026-10-20T03:00")]]; });
+  const r = readAt(s, "2026-10-20T06:00", 25);   // estimate 20% + 19.8 kWh ≈ 54%
+  assert.strictEqual(r.logged, null);   // no drive since: nothing for socLog
+  assert.strictEqual(r.q, "low");
+  assert.ok(r.reading.chargedKwh > 0.05);   // so "didn't run fully" is offered
+  // a nudge a few minutes later keeps that (the charging was before the first change)
+  const nudged = addReading(r.history, null, 24, 58, new Date("2026-10-20T06:04"), 0);
+  assert.deepStrictEqual([nudged.length, nudged[0].pct, nudged[0].chargedKwh], [1, 24, r.reading.chargedKwh]);
+  const x = explainReading(r.history, r.log, r.reading.at, "charging-short");
+  assert.strictEqual(x.history[x.history.length - 1].cause, "charging-short");
+});
+
+test("below after a drive: drove more corrects the km; charging answers keep it out of consumption", () => {
+  const s = hist("2026-10-19T06:00");
+  const r = readAt(s, "2026-10-19T18:00", 45);   // estimate 57%, car 45%: 20.3 vs 13.26 kWh
+  assert.strictEqual(r.q, "low");
+  assert.strictEqual(r.logged.chosenKwh, 0);
+  assert.ok(usableReading(r.logged));
+  s.overrides = { "2026-10-19": 120 };
+  let log = relogKm(r.log, s);
+  ({ socLog: log } = explainReading(r.history, log, r.reading.at, "drove"));
+  assert.deepStrictEqual([log[0].km, log[0].cause], [120, "km"]);
+  const c = explainReading(r.history, r.log, r.reading.at, "charged-elsewhere");
+  assert.strictEqual(c.socLog[0].cause, "charging");
+  assert.ok(!usableReading(c.socLog[0]));
+});
+
+test("above the estimate asks the other way; small differences ask nothing", () => {
+  const s = hist("2026-10-19T06:00");
+  assert.strictEqual(readAt(s, "2026-10-19T18:00", 70).q, "high");   // 70% vs 57%
+  assert.strictEqual(readAt(s, "2026-10-19T18:00", 55).q, null);      // 2 points
+  assert.strictEqual(readAt(hist("2026-10-17T10:00"), "2026-10-17T15:00", 77).q, null);   // Sat, 3 points, no drive
+  // a single drive home (level set at work) never asks, however far off (#21)
+  assert.strictEqual(readAt(hist("2026-10-19T12:00"), "2026-10-19T18:00", 50).q, null);
+});
+
+test("Saturday errand: asked with no drive since, recorded as a drive at the reading", () => {
+  const s = hist("2026-10-17T10:00");   // Sat, no commute
+  const r = readAt(s, "2026-10-17T15:00", 72);   // 8 points below 80%
+  assert.deepStrictEqual([r.q, r.logged], ["low", null]);
+  let h = addErrand(r.history, 25, s, r.reading.at);
+  h = addErrand(h, 30, s, r.reading.at);   // changed: replaces
+  const d = h.filter(e => e.k === "drive");
+  assert.deepStrictEqual(d.map(e => [e.km, e.src, e.dep, e.at, e.date]), [[30, "errand", null, ms("2026-10-17T15:00") - 1, "2026-10-17"]]);
+  assert.deepStrictEqual(h.map(e => e.k), ["drive", "reading"]);
+  assert.strictEqual(addErrand(h, 0, s, r.reading.at).filter(e => e.k === "drive").length, 0);
+  // an errand on a commute day doesn't stop the commute being recorded, nor follow a km correction
+  const m = hist("2026-10-19T05:00"), e = addErrand([], 10, m, ms("2026-10-19T06:00"));
+  const rec = recordHistory({ ...m, history: e, histAt: ms("2026-10-19T06:00") }, new Date("2026-10-19T18:00")).history;
+  assert.deepStrictEqual(rec.map(x => [x.src, x.km]), [["errand", 10], ["schedule", 78]]);
+  m.overrides = { "2026-10-19": 90 };
+  assert.deepStrictEqual(correctDrive(rec, "2026-10-19", m).map(x => x.km), [10, 90]);
+});
+
+test("impossible consumption is not usable, without an answer", () => {
+  const s = hist("2026-10-19T06:00");
+  const neg = readAt(s, "2026-10-19T18:00", 85).logged;   // higher than before the drive
+  assert.ok(neg.actKwh < 0 && !usableReading(neg));
+  assert.ok(!usableReading(readAt(s, "2026-10-19T18:00", 20).logged));   // 34.8 kWh for 78 km = 45 kWh/100 km
 });
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");

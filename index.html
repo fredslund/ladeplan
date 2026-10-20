@@ -312,7 +312,7 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, deviates, levelEst, readingEst, rollLevel,
+  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand,
   recordHistory, addReading, addLevel, correctDrive, historyCsv
 } from "./ladeplan.js";
 
@@ -357,9 +357,10 @@ async function fetchWeather(){
 /* ---------- page state ---------- */
 const S = loadSettings();
 let DATA=null, MODEL=null, DEMO=false;
-// SOC_SET: the level as of S.socAt (S.soc follows the slider while dragging). FOLLOW: ask about the distance
-// after a reading far off the estimate. KM_OPEN: the km field under the estimate is shown.
-let SOC_SET=S.soc, FOLLOW=false, KM_OPEN=false;
+// SOC_SET: the level as of S.socAt (S.soc follows the slider while dragging). ASK: after a reading far off the
+// estimate, what to ask ({ dir: low|high, at, date: logged drive day or null, charging, km: field shown }).
+// KM_OPEN: the km field under the estimate is shown.
+let SOC_SET=S.soc, ASK=null, KM_OPEN=false;
 
 // Set the level as of now: a reading of the car (slider), or an estimate ("Use", rollLevel()) kept unrounded
 function setSoc(v, now, reading){
@@ -401,15 +402,38 @@ function renderSocUpdate(now){
     // "Use" accepts the estimate: not a reading, so the next reading is still logged from the last one
     document.getElementById("socUse").onclick=()=>{
       const t=new Date(), v=est.kwh/est.B*100;
-      FOLLOW=KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
+      ASK=null; KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
     };
     document.getElementById("socKm").onclick=()=>{ KM_OPEN=!KM_OPEN; renderSocUpdate(new Date()); if (KM_OPEN) document.getElementById("socKmIn").focus(); };
   }
-  else if (FOLLOW && last){
-    const c=v=>last.km>0 ? (v/last.km*100).toFixed(1) : "–";
-    box.innerHTML=`<p>That's ≈ ${c(last.actKwh)} kWh/100 km for ${Math.round(last.km)} km; expected ${c(last.predKwh)}. Different distance?</p>
-      <div class="row">${kmField(last.date)}<button type="button" class="btn ghost" id="socOk">OK</button></div>`;
-    document.getElementById("socOk").onclick=()=>{ FOLLOW=false; renderSocUpdate(new Date()); };
+  else if (ASK){
+    // Answers that fit the direction; none is required. "Drove more/less" corrects the logged day's km, or
+    // (no drive since the last level) records an errand.
+    const r=S.history.find(e=>e.k==="reading" && e.at===ASK.at);
+    if (!r){ ASK=null; return renderSocUpdate(now); }
+    const pts=Math.round(Math.abs(r.pct-r.estPct)), low=ASK.dir==="low";
+    const opts=low ? [["drove","Drove more"], ...(ASK.charging?[["charging-short","Charging didn't run fully"]]:[]), ["ok","Just off"]]
+      : [["charged-elsewhere","Charged somewhere else"], ...(ASK.date?[["drove","Drove less"]]:[]), ["ok","Just off"]];
+    const field = !ASK.km ? "" : ASK.date ? kmField(ASK.date)
+      : `<label class="field"><span>Km driven (errand)</span><input type="number" min="0" step="1" id="socErrand" value="${S.history.find(e=>e.src==="errand" && e.at<ASK.at && e.at>ASK.at-10*60e3)?.km ?? ""}"></label>`;
+    box.innerHTML=`<p><b>${pts} points ${low?"below":"above"}</b> the estimated ${Math.round(r.estPct)}%. What was different?</p>
+      ${ASK.km ? `<div class="row">${field}<button type="button" class="btn ghost" id="socAskDone">Done</button></div>`
+        : `<div class="row">${opts.map(([c,l])=>`<button type="button" class="btn ghost" data-cause="${c}">${l}</button>`).join("")}</div>`}`;
+    const answer=c=>{ Object.assign(S, explainReading(S.history, S.socLog, ASK.at, c)); saveSettings(); };
+    for (const b of box.querySelectorAll("[data-cause]")) b.onclick=()=>{
+      const c=b.dataset.cause;
+      if (c==="drove"){ ASK.km=true; renderSocUpdate(new Date()); document.getElementById(ASK.date?"socKmIn":"socErrand").focus(); return; }
+      answer(c); ASK=null; renderSocUpdate(new Date());
+    };
+    const done=document.getElementById("socAskDone");
+    if (done) done.onclick=()=>{ ASK=null; renderSocUpdate(new Date()); document.getElementById("soc").focus(); };
+    const errand=document.getElementById("socErrand");
+    if (errand) errand.onchange=()=>{
+      if (errand.value.trim()==="" || !isFinite(Number(errand.value))) return;
+      S.history=addErrand(S.history, Math.max(0, Math.round(Number(errand.value))), S, ASK.at);
+      answer("drove");
+      if (!document.getElementById("logView").hidden) renderLog();
+    };
   }
   else if (lv && lv.chargedKwh>0.05){
     // No drive since, but planned charging: the plan assumes it ran, so show it (and catch a session that didn't)
@@ -419,7 +443,7 @@ function renderSocUpdate(now){
       ${useBtn(lv)}${ageNote}`;
     document.getElementById("socUse").onclick=()=>{
       const t=new Date(), v=lv.kwh/lv.B*100;
-      FOLLOW=KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
+      ASK=null; KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
     };
   }
   else if (age) box.innerHTML=ageNote;
@@ -430,7 +454,7 @@ function renderSocUpdate(now){
     km.onchange=()=>{
       if (km.value.trim()==="" || !isFinite(Number(km.value))) return;
       setKm(km.dataset.day, Math.max(0, Math.round(Number(km.value))));
-      if (!est) S.socLog=relogKm(S.socLog, S);
+      if (ASK){ S.socLog=relogKm(S.socLog, S); Object.assign(S, explainReading(S.history, S.socLog, ASK.at, "drove")); }
       saveSettings(); renderTrips(new Date()); recompute();
     };
     if (refocus) km.focus();
@@ -678,11 +702,14 @@ function bindInputs(){
   soc.addEventListener("input",()=>{ S.soc=Number(soc.value); out.textContent=S.soc+"%"; recompute(); });
   // A slider change is a reading of the car. After a drive it's logged against the estimate.
   soc.addEventListener("change",()=>{
-    const now=new Date();
+    const now=new Date(), t=now.getTime();
+    // Charging since the last reading (or level), for the "didn't run fully" answer
+    const sinceRead=levelEst(S.readAt ? {...S, soc:S.readSoc, socAt:S.readAt} : {...S, soc:SOC_SET}, now);
     S.socLog=logReading(S.socLog, readingEst(S, now), S.soc, S, now);
-    S.history=addReading(S.history, levelEst({...S, soc:SOC_SET}, now), S.soc, S.battery, now);
-    const last=S.socLog[S.socLog.length-1];
-    FOLLOW=!!last && last.at===now.getTime() && deviates(last, S);
+    S.history=addReading(S.history, levelEst({...S, soc:SOC_SET}, now), S.soc, S.battery, now, sinceRead ? sinceRead.chargedKwh : 0);
+    const last=S.socLog[S.socLog.length-1], logged=last && last.at===t ? last : null;
+    const reading=S.history.findLast(e=>e.k==="reading"), dir=readingQuestion(reading, logged, S);
+    ASK = dir ? { dir, at:reading.at, date:logged ? logged.date : null, charging:reading.chargedKwh>0.05, km:false } : null;
     KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
   });
   document.getElementById("reload").addEventListener("click",()=>{ DEMO=false; load(); });
@@ -690,6 +717,7 @@ function bindInputs(){
 }
 
 // History view: days newest first, entries in order within a day
+const CAUSE={ drove:"Distance corrected", "charging-short":"Charging didn't run fully", "charged-elsewhere":"Charged somewhere else", ok:"Just off" };
 function renderLog(){
   const list=document.getElementById("logList"), now=new Date();
   if (!S.history.length){ list.innerHTML=`<p class="note">Nothing yet. Drives and charging appear here once they have happened.</p>`; return; }
@@ -701,9 +729,9 @@ function renderLog(){
     const d=new Date(k+"T12:00"), diff=Math.round((startOfDay(now)-startOfDay(d))/864e5);
     const title=diff===0 ? "Today" : diff===1 ? "Yesterday" : `${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}`;
     return `<section class="card lday"><h2 class="sh">${title}</h2>${es.map(e=>
-      e.k==="drive" ? row(`${hhmm(e.dep)}–${hhmm(e.at)}`, `Drove ${e.km} km`, `${e.cons} kWh/100 km${e.src==="override"?" · km corrected":""}`, kwh(-e.kwh))
+      e.k==="drive" ? row(e.dep ? `${hhmm(e.dep)}–${hhmm(e.at)}` : hhmm(e.at+1), `Drove ${e.km} km`, `${e.src==="errand"?"Errand · ":""}${e.cons} kWh/100 km${e.src==="override"?" · km corrected":""}`, kwh(-e.kwh))
       : e.k==="charge" ? row(`${hhmm(e.at)}–${hhmm(e.end)}`, "Charged", e.chosen ? "Chosen" : "Assumed from the plan", kwh(e.kwh, true), "plus")
-      : e.k==="reading" ? row(hhmm(e.at), `Reading ${Math.round(e.pct)}%`, e.estPct!=null ? `Estimated ${Math.round(e.estPct)}%` : "No estimate", e.diffKwh!=null ? kwh(e.diffKwh, true) : "")
+      : e.k==="reading" ? row(hhmm(e.at), `Reading ${Math.round(e.pct)}%`, (e.estPct!=null ? `Estimated ${Math.round(e.estPct)}%` : "No estimate") + (CAUSE[e.cause] ? ` · ${CAUSE[e.cause]}` : ""), e.diffKwh!=null ? kwh(e.diffKwh, true) : "")
       : row(hhmm(e.at), `${e.how==="use"?"Estimate used":"Moved forward"} · ${Math.round(e.pct)}%`, "Estimate, not a reading")
     ).join("")}</section>`;
   }).join("");
