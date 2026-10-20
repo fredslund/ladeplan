@@ -119,9 +119,12 @@ input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visi
 .mbtn.h{background:var(--bg)}
 .mbtn.w{background:var(--known);border-color:var(--known);color:#fff}
 .mbtn.now{box-shadow:inset 0 -3px 0 var(--ink)}
-.trip{display:grid;grid-template-columns:1fr 6.5em auto;gap:10px;align-items:center}
+.trip{display:grid;grid-template-columns:1fr 6.5em;gap:10px;align-items:center}
 .trip .d{font-weight:500}
 .trip .d small{color:var(--muted);font-weight:400;margin-left:4px}
+/* A changed day: its usual km and Reset on a second line, so the inputs stay in one column */
+.trip .usual{display:block;font-size:12.5px;font-weight:400;color:var(--muted)}
+.trip .usual .linkbtn{font-size:12.5px;padding:2px 4px;margin:-2px -4px}
 .linkbtn{background:none;border:0;color:var(--known);font:500 13px var(--sans);cursor:pointer;padding:4px}
 .btn{font:600 14px var(--sans);background:var(--known);color:#fff;border:0;border-radius:8px;padding:10px 14px;cursor:pointer}
 .btn.ghost{background:transparent;color:var(--known);border:1px solid var(--line)}
@@ -617,16 +620,20 @@ function renderTrips(now){
   for (let i=0;i<7;i++){
     const day=addDays(startOfDay(now),i), key=dateKey(day);
     const pat=S.pattern[monIdx(day)]?2*S.kmOneWay:0, ov=S.overrides[key];
+    // An override that matches the weekly pattern changes nothing for now, so it isn't shown as changed
+    const changed=ov!=null && ov!==pat;
     const row=document.createElement("div"); row.className="trip";
-    row.innerHTML=`<div class="d">${i===0?"Today":i===1?"Tomorrow":DOW[day.getDay()]}<small>${day.getDate()}/${day.getMonth()+1}</small></div>
-      <input type="number" min="0" step="1" id="trip_${key}" aria-label="Kilometres on ${key}" value="${ov!=null?ov:pat}">
-      <button type="button" class="linkbtn" ${ov==null?"hidden":""}>Reset</button>`;
+    row.innerHTML=`<div class="d">${i===0?"Today":i===1?"Tomorrow":DOW[day.getDay()]}<small>${day.getDate()}/${day.getMonth()+1}</small>
+        ${changed?`<span class="usual" id="usual_${key}">usual ${pat} km · <button type="button" class="linkbtn" aria-label="Reset to ${pat} km">Reset</button></span>`:""}</div>
+      <input type="number" min="0" step="1" id="trip_${key}" aria-label="Kilometres on ${key}" value="${ov!=null?ov:pat}"${changed?` aria-describedby="usual_${key}"`:""}>`;
     row.querySelector("input").addEventListener("change",e=>{
-      const v=Math.max(0,Number(e.target.value)||0);
-      if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
-      S.history=correctDrive(S.history, key, S); saveSettings(); renderTrips(now); recompute();
+      // An emptied field keeps the previous value instead of becoming 0 (car home)
+      const v=e.target.value;
+      if (v.trim()==="" || !isFinite(Number(v))){ e.target.value=kmOn(day,S); return; }
+      setKm(key, Math.max(0, Math.round(Number(v)))); saveSettings(); renderTrips(now); recompute();
     });
-    row.querySelector("button").addEventListener("click",()=>{ delete S.overrides[key]; S.history=correctDrive(S.history, key, S); saveSettings(); renderTrips(now); recompute(); });
+    // The row is rebuilt without the button, so keep focus on that day's field
+    if (changed) row.querySelector("button").addEventListener("click",()=>{ setKm(key, pat); saveSettings(); renderTrips(now); recompute(); document.getElementById(`trip_${key}`).focus(); });
     box.appendChild(row);
   }
 }
