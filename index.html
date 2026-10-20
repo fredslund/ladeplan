@@ -290,7 +290,7 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, socEstimate, logReading, relogKm, deviates, levelEst
+  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, deviates, levelEst, readingEst, rollLevel
 } from "./ladeplan.js";
 
 /* ---------- storage ---------- */
@@ -338,9 +338,11 @@ let DATA=null, MODEL=null, DEMO=false;
 // after a reading far off the estimate. KM_OPEN: the km field under the estimate is shown.
 let SOC_SET=S.soc, FOLLOW=false, KM_OPEN=false;
 
-function setSoc(v, now){
+// Set the level as of now: a reading of the car (slider), or an estimate ("Use", rollLevel()) kept unrounded
+function setSoc(v, now, reading){
   S.soc=SOC_SET=v; S.socAt=now.getTime();
-  document.getElementById("soc").value=v; document.getElementById("socOut").textContent=v+"%";
+  if (reading){ S.readAt=S.socAt; S.readSoc=v; }
+  document.getElementById("soc").value=Math.round(v); document.getElementById("socOut").textContent=Math.round(v)+"%";
 }
 function setKm(key, v){
   const day=new Date(key+"T12:00"), pat=S.pattern[monIdx(day)]?2*S.kmOneWay:0;
@@ -355,6 +357,12 @@ function renderSocUpdate(now){
   // The field always edits the whole day's km; say so when only one drive of it is counted
   const kmField=(key, half)=>{ const d=new Date(key+"T12:00");
     return `<label class="field"><span>Km driven ${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}${half?" (round trip)":""}</span><input type="number" min="0" step="1" id="socKmIn" data-day="${key}" value="${kmOn(d,S)}"></label>`; };
+  // How old the last reading is; the level is estimated since then
+  const read=S.readAt ? new Date(S.readAt) : null, ageDays=read ? (now-read)/864e5 : 0;
+  const age=!S.socAt ? "" : !read ? "No reading of the car yet." : ageDays<1 ? ""
+    : `Last reading ${DOW[read.getDay()]} ${read.getDate()}/${read.getMonth()+1}.${ageDays>=7?" Set the slider when you're at the car.":""}`;
+  const ageNote=age ? `<p class="note">${age}</p>` : "";
+  const from=e=>`${Math.round(e.fromPct)}% (${e.from===S.readAt?"":"est. "}${set(e.from)})`;
   const set=from=>dateKey(new Date(from))===dateKey(now) ? hhmm(from) : `${DOW[new Date(from).getDay()]} ${hhmm(from)}`;
   const charged=e=>e.chargedKwh>0.05 ? ` + ${e.chargedKwh.toFixed(1)} kWh charging (${e.chosenKwh>=e.chargedKwh-0.05 ? "chosen" : e.chosenKwh>0.05 ? `${e.chosenKwh.toFixed(1)} chosen, rest assumed from the plan` : "assumed from the plan"})` : "";
   const useBtn=(e, extra="")=>`<div class="row"><button type="button" class="btn" id="socUse">Use ${e.pct}%</button>${extra}</div>`;
@@ -363,13 +371,12 @@ function renderSocUpdate(now){
     const days=est.trips.length>1 ? ` (${est.trips.length} drives, ${est.trips.map(t=>DOW[new Date(t.back).getDay()]).join(", ")})`
       : lastTrip.leg==="out" ? " drive to work" : lastTrip.leg==="back" ? " drive home" : "";
     box.innerHTML=`<p><b>${lastTrip.leg==="out"?"At work?":"Back home?"}</b> Estimated <span class="num">${est.pct}%</span></p>
-      <p class="note">${est.fromPct}% (${set(est.from)})${charged(est)} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). The plan uses this; or set the slider to what the car shows.</p>
+      <p class="note">${from(est)}${charged(est)} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). The plan uses this; or set the slider to what the car shows.</p>
       ${useBtn(est, `<button type="button" class="linkbtn" id="socKm" aria-expanded="${KM_OPEN}">Edit km</button>`)}
-      <div ${KM_OPEN?"":"hidden"}>${kmField(lastTrip.key, half)}</div>`;
+      <div ${KM_OPEN?"":"hidden"}>${kmField(lastTrip.key, half)}</div>${ageNote}`;
+    // "Use" accepts the estimate: not a reading, so the next reading is still logged from the last one
     document.getElementById("socUse").onclick=()=>{
-      const t=new Date();
-      S.socLog=logReading(S.socLog, est, null, S, t); FOLLOW=KM_OPEN=false;
-      setSoc(est.pct, t); saveSettings(); recompute();
+      FOLLOW=KM_OPEN=false; setSoc(est.kwh/est.B*100, new Date()); saveSettings(); recompute();
     };
     document.getElementById("socKm").onclick=()=>{ KM_OPEN=!KM_OPEN; renderSocUpdate(new Date()); if (KM_OPEN) document.getElementById("socKmIn").focus(); };
   }
@@ -383,10 +390,11 @@ function renderSocUpdate(now){
     // No drive since, but planned charging: the plan assumes it ran, so show it (and catch a session that didn't)
     const t=now.getTime(), running=S.planned.some(([a,b])=>a<=t && b>t);
     box.innerHTML=`<p><b>${running?"Charging":"Charged?"}</b> Estimated <span class="num">${lv.pct}%</span>${running?" so far":""}</p>
-      <p class="note">${lv.fromPct}% (${set(lv.from)})${charged(lv)}. The plan uses this; or set the slider to what the car shows.</p>
-      ${useBtn(lv)}`;
-    document.getElementById("socUse").onclick=()=>{ FOLLOW=KM_OPEN=false; setSoc(lv.pct, new Date()); saveSettings(); recompute(); };
+      <p class="note">${from(lv)}${charged(lv)}. The plan uses this; or set the slider to what the car shows.</p>
+      ${useBtn(lv)}${ageNote}`;
+    document.getElementById("socUse").onclick=()=>{ FOLLOW=KM_OPEN=false; setSoc(lv.kwh/lv.B*100, new Date()); saveSettings(); recompute(); };
   }
+  else if (age) box.innerHTML=ageNote;
   else { box.hidden=true; box.innerHTML=""; return; }
   box.hidden=false;
   const km=document.getElementById("socKmIn");
@@ -638,15 +646,15 @@ function bindInputs(){
     });
   });
   const soc=document.getElementById("soc"), out=document.getElementById("socOut");
-  soc.value=S.soc; out.textContent=S.soc+"%";
+  soc.value=Math.round(S.soc); out.textContent=Math.round(S.soc)+"%";
   soc.addEventListener("input",()=>{ S.soc=Number(soc.value); out.textContent=S.soc+"%"; recompute(); });
   // A slider change is a reading of the car. After a drive it's logged against the estimate.
   soc.addEventListener("change",()=>{
     const now=new Date();
-    S.socLog=logReading(S.socLog, socEstimate({...S, soc:SOC_SET}, now), S.soc, S, now);
+    S.socLog=logReading(S.socLog, readingEst(S, now), S.soc, S, now);
     const last=S.socLog[S.socLog.length-1];
     FOLLOW=!!last && last.at===now.getTime() && deviates(last, S);
-    KM_OPEN=false; setSoc(S.soc, now); saveSettings(); recompute();
+    KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
   });
   document.getElementById("reload").addEventListener("click",()=>{ DEMO=false; load(); });
   document.getElementById("demo").addEventListener("click",()=>{ DEMO=true; load(); });
@@ -654,6 +662,9 @@ function bindInputs(){
 
 function recompute(){
   const now=new Date();
+  // Move a day-old level forward to the estimate (not while dragging, nor with example data)
+  const roll=!DEMO && S.soc===SOC_SET ? rollLevel(S, now) : null;
+  if (roll){ setSoc(roll.soc, new Date(roll.socAt)); saveSettings(); }
   renderSocUpdate(now);
   if (!DATA) return;
   const {hours, model}=buildHours(DATA.prices, DATA.weather, S, now);
@@ -699,7 +710,7 @@ async function load(){
 
 if (typeof document!=="undefined" && document.getElementById("decision")){
   // Drop overrides older than today, or than the last battery reading (its drives may still need them), max 14 days
-  const nowMs=Date.now(), keep=dateKey(new Date(Math.max(nowMs-14*864e5, Math.min(nowMs, S.socAt||nowMs))));
+  const nowMs=Date.now(), keep=dateKey(new Date(Math.max(nowMs-14*864e5, Math.min(nowMs, S.socAt||nowMs, S.readAt||nowMs))));
   for (const k of Object.keys(S.overrides)) if (k<keep) delete S.overrides[k];
   if (S.commit && S.commit.until<=nowMs) S.commit=null;   // the car has left since the choice
   // Settings live on their own page at #settings, so the back gesture closes it
