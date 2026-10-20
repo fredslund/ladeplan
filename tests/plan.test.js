@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, socEstimate, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -448,6 +448,39 @@ test("plan starts from the estimate: the drive to work is subtracted", () => {
   // set at home after the drive: the whole day is subtracted until the level is updated
   const eve = new Date("2026-10-19T19:00"), d2 = demoData(eve), h2 = buildHours(d2.prices, d2.weather, s, eve).hours;
   assert.ok(Math.abs(plan(h2, s, eve).soc0 - (0.3 * 58 - 13.26)) < 1e-9);
+});
+
+test("plan counts planned charging since the level was set, before any drive", () => {
+  const eve = new Date("2026-10-19T21:00"), d = demoData(eve), s = soc("2026-10-19T21:00", s => { s.soc = 20; });
+  const P1 = plan(buildHours(d.prices, d.weather, s, eve).hours, s, eve);
+  s.planned = notePlanned([], P1, eve, s);
+  const night = P1.blocks.filter(b => b.start < P1.nextDrive.t), kw = 11 * 0.9;
+  const stored = s.planned.reduce((a, w) => a + (w[1] - w[0]) / 3600e3 * kw, 0);
+  assert.ok(night.length && stored > 5, stored);
+  // 06:00, before leaving: the night's charging is in the level, so nothing more is needed
+  const morn = new Date("2026-10-20T06:00"), d2 = demoData(morn), h2 = buildHours(d2.prices, d2.weather, s, morn).hours;
+  const P2 = plan(h2, s, morn);
+  assert.ok(Math.abs(P2.soc0 - (0.2 * 58 + stored)) < 1e-6, P2.soc0);
+  assert.strictEqual(socEstimate(s, morn), null);   // no drive yet: no reading to offer
+  assert.strictEqual(levelEst(s, morn).trips.length, 0);
+  assert.strictEqual(P2.mustKwh, 0);
+  assert.ok(!P2.blocks.some(b => b.start < P2.nextDrive.t));
+  // halfway through the window: the part so far is in the level, the rest is still planned, no double count
+  const mid = new Date((night[0].start + night[0].end) / 2), d3 = demoData(mid);
+  const P3 = plan(buildHours(d3.prices, d3.weather, s, mid).hours, s, mid);
+  assert.ok(Math.abs(P3.soc0 - (0.2 * 58 + (mid - night[0].start) / 3600e3 * kw)) < 1e-6, P3.soc0);
+  const same = soc(mid.toISOString(), x => { x.soc = P3.soc0 / 58 * 100; });   // as if that level were set now
+  const r = P => P.blocks.map(b => [b.start, b.end, b.kwh.toFixed(6)]);
+  assert.deepStrictEqual(r(P3), r(plan(buildHours(d3.prices, d3.weather, same, mid).hours, same, mid)));
+});
+
+test("with Don't charge chosen, the level stays as set", () => {
+  const eve = new Date("2026-10-19T21:00"), d = demoData(eve), hours = buildHours(d.prices, d.weather, clone(DEF), eve).hours;
+  const s = soc("2026-10-19T21:00", s => { s.soc = 20; s.commit = { kind: "none", until: ms("2026-10-20T07:30"), windows: [], limit: null, at: ms("2026-10-19T21:00") }; });
+  s.planned = notePlanned([], plan(hours, s, eve), eve, s);
+  assert.deepStrictEqual(s.planned.filter(w => w[0] < ms("2026-10-20T07:30")), []);
+  const morn = new Date("2026-10-20T06:00"), d2 = demoData(morn);
+  assert.ok(Math.abs(plan(buildHours(d2.prices, d2.weather, s, morn).hours, s, morn).soc0 - 0.2 * 58) < 1e-9);
 });
 
 test("a reading at work and one at home log the two drives", () => {

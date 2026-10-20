@@ -217,8 +217,8 @@ function drivesFor(s, now, horizonEnd){
 
 function plan(hours, s, now){
   const nowMs=now.getTime(), B=s.battery, eff=s.effPct/100;
-  // Start from the estimate when the car has driven since the level was set (e.g. to work), else the level set
-  const est=socEstimate(s, now), res=B*s.reserve/100, soc0=est ? est.kwh : B*s.soc/100;
+  // Start from the level now: the level set, plus charging planned and drives made since (levelEst())
+  const est=levelEst(s, now), res=B*s.reserve/100, soc0=est ? est.kwh : B*s.soc/100;
   const end = hours.length ? hours[hours.length-1].t+H : nowMs;
   const events=drivesFor(s, now, end).sort((a,b)=>a.t-b.t);
   // Energy that must be charged before the next departure to keep the reserve, whatever the price.
@@ -363,22 +363,23 @@ function notePlanned(planned, P, now, s){
   const chosen=b=>P.commit && b.start<P.commit.until;
   return [...past, ...P.blocks.filter(b=>b.start<leave).map(b=>[Math.round(b.start), Math.round(b.end), ...(chosen(b)?[1]:[])])];
 }
-// Battery level now, from the level set at s.socAt, plus planned charging since then, minus the drives
-// (legs, see drivesDone()) since then at the season's consumption. null if no drive was made since (or socAt is
-// unknown or over two weeks old). plan() starts from this estimate when there is one.
-function socEstimate(s, now){
+// Battery level now, from the level set at s.socAt, plus planned charging since then (assumes the plan was
+// followed), minus the drives (legs, see drivesDone()) since then at the season's consumption. null if socAt
+// is unknown or over two weeks old. plan() starts from this.
+function levelEst(s, now){
   const to=now.getTime(), from=s.socAt;
   if (!(from>0) || from>to || to-from>14*DAY) return null;
   const trips=drivesDone(s, from, to);
-  if (!trips.length) return null;
   const B=s.battery, kw=s.chargerKw*s.effPct/100;
   const kwhIn=w=>Math.max(0, Math.min(w[1],to)-Math.max(w[0],from))/H*kw;
   const chargedKwh=s.planned.reduce((a,w)=>a+kwhIn(w), 0), chosenKwh=s.planned.reduce((a,w)=>a+(w[2] ? kwhIn(w) : 0), 0);
   const usedKwh=trips.reduce((a,t)=>a+t.kwh,0), km=trips.reduce((a,t)=>a+t.km,0);
   const startKwh=B*s.soc/100+chargedKwh;
   const kwh=Math.min(B, Math.max(0, startKwh-usedKwh));
-  return { from, fromPct:s.soc, chargedKwh, chosenKwh, trips, km, usedKwh, cons:usedKwh/km*100, startKwh, kwh, pct:Math.round(kwh/B*100) };
+  return { from, fromPct:s.soc, chargedKwh, chosenKwh, trips, km, usedKwh, cons:km ? usedKwh/km*100 : null, startKwh, kwh, pct:Math.round(kwh/B*100) };
 }
+// The estimate to offer as a reading after a drive: null if no drive was made since the level was set.
+function socEstimate(s, now){ const e=levelEst(s, now); return e && e.trips.length ? e : null; }
 const r2 = v => Math.round(v*100)/100;
 // Log a reading after a drive (actualPct null = the estimate was accepted). A change within 10 minutes of the
 // last reading with no drive ended since is a nudge of the slider: it corrects that reading instead of adding one.
@@ -599,5 +600,5 @@ export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
   SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, priceRating, kmOn,
-  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, socEstimate, logReading, relogKm, deviates, limitFor, commitFrom
+  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, logReading, relogKm, deviates, limitFor, commitFrom
 };
