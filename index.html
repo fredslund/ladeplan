@@ -138,6 +138,16 @@ a.inl{color:var(--known)}
 .err{color:var(--warn)}
 .note{font-size:12.5px;color:var(--muted)}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.soc .histlink{grid-column:1/-1;justify-self:end;margin:-6px -4px -8px 0;font-size:13px;text-decoration:none}
+.lday{display:flex;flex-direction:column}
+.lday .sh{font-size:15px;margin:0 0 4px}
+.lrow{display:grid;grid-template-columns:7.4em 1fr auto;gap:10px;padding:7px 0;border-top:1px solid var(--line);align-items:baseline;font-variant-numeric:tabular-nums}
+.lday .sh+.lrow{border-top:0}
+.lrow .when{font:500 13px var(--mono);color:var(--muted)}
+.lrow .what small{display:block;color:var(--muted);font-size:12.5px}
+.lrow .val{font:500 13.5px var(--mono);text-align:right;white-space:nowrap}
+.lrow .val.plus{color:var(--good)}
+.csvout{width:100%;min-height:8em;font:12px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -159,6 +169,7 @@ a.inl{color:var(--known)}
     <input type="range" id="soc" min="0" max="100" step="1">
     <output id="socOut">–</output>
     <div class="socup" id="socUpdate" aria-live="polite" hidden></div>
+    <a href="#log" class="linkbtn histlink" id="openLog">History</a>
   </section>
 
   <section class="card decision" id="decision">
@@ -210,10 +221,21 @@ a.inl{color:var(--known)}
   </details>
 </div>
 
+<div class="view" id="logView" hidden>
+  <header>
+    <h1 id="logTitle" tabindex="-1">History</h1>
+    <a href="#" class="btn ghost close">Done</a>
+  </header>
+  <p class="note">What the app assumes happened, for checking against the car. Drives follow your schedule and km corrections; charging is what the plan showed (assumed) or what you chose; readings are levels you set from the car. Kept for 120 days.</p>
+  <div id="logList" class="view"></div>
+  <div class="row"><button type="button" class="btn ghost" id="logCsv">Copy as CSV</button><span class="note" id="logCsvMsg" aria-live="polite"></span></div>
+  <textarea class="csvout" id="logCsvOut" readonly hidden aria-label="History as CSV"></textarea>
+</div>
+
 <div class="view" id="settingsView" hidden>
   <header>
     <h1 id="settingsTitle" tabindex="-1">Settings</h1>
-    <a href="#" class="btn ghost" id="closeSettings">Done</a>
+    <a href="#" class="btn ghost close" id="closeSettings">Done</a>
   </header>
   <p class="note">These rarely change. Everything is saved on this device as you edit.</p>
   <section class="card set">
@@ -290,7 +312,8 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, deviates, levelEst, readingEst, rollLevel
+  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, deviates, levelEst, readingEst, rollLevel,
+  recordHistory, addReading, addLevel, correctDrive, historyCsv
 } from "./ladeplan.js";
 
 /* ---------- storage ---------- */
@@ -347,6 +370,7 @@ function setSoc(v, now, reading){
 function setKm(key, v){
   const day=new Date(key+"T12:00"), pat=S.pattern[monIdx(day)]?2*S.kmOneWay:0;
   if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
+  S.history=correctDrive(S.history, key, S);
 }
 // After a drive (or once the car has left for work): offer the estimated level, which the plan already uses;
 // after a reading far off the estimate, ask about the distance; after planned charging, show the level it assumes.
@@ -376,7 +400,8 @@ function renderSocUpdate(now){
       <div ${KM_OPEN?"":"hidden"}>${kmField(lastTrip.key, half)}</div>${ageNote}`;
     // "Use" accepts the estimate: not a reading, so the next reading is still logged from the last one
     document.getElementById("socUse").onclick=()=>{
-      FOLLOW=KM_OPEN=false; setSoc(est.kwh/est.B*100, new Date()); saveSettings(); recompute();
+      const t=new Date(), v=est.kwh/est.B*100;
+      FOLLOW=KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
     };
     document.getElementById("socKm").onclick=()=>{ KM_OPEN=!KM_OPEN; renderSocUpdate(new Date()); if (KM_OPEN) document.getElementById("socKmIn").focus(); };
   }
@@ -392,7 +417,10 @@ function renderSocUpdate(now){
     box.innerHTML=`<p><b>${running?"Charging":"Charged?"}</b> Estimated <span class="num">${lv.pct}%</span>${running?" so far":""}</p>
       <p class="note">${from(lv)}${charged(lv)}. The plan uses this; or set the slider to what the car shows.</p>
       ${useBtn(lv)}${ageNote}`;
-    document.getElementById("socUse").onclick=()=>{ FOLLOW=KM_OPEN=false; setSoc(lv.kwh/lv.B*100, new Date()); saveSettings(); recompute(); };
+    document.getElementById("socUse").onclick=()=>{
+      const t=new Date(), v=lv.kwh/lv.B*100;
+      FOLLOW=KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
+    };
   }
   else if (age) box.innerHTML=ageNote;
   else { box.hidden=true; box.innerHTML=""; return; }
@@ -572,9 +600,9 @@ function renderTrips(now){
     row.querySelector("input").addEventListener("change",e=>{
       const v=Math.max(0,Number(e.target.value)||0);
       if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
-      saveSettings(); renderTrips(now); recompute();
+      S.history=correctDrive(S.history, key, S); saveSettings(); renderTrips(now); recompute();
     });
-    row.querySelector("button").addEventListener("click",()=>{ delete S.overrides[key]; saveSettings(); renderTrips(now); recompute(); });
+    row.querySelector("button").addEventListener("click",()=>{ delete S.overrides[key]; S.history=correctDrive(S.history, key, S); saveSettings(); renderTrips(now); recompute(); });
     box.appendChild(row);
   }
 }
@@ -652,6 +680,7 @@ function bindInputs(){
   soc.addEventListener("change",()=>{
     const now=new Date();
     S.socLog=logReading(S.socLog, readingEst(S, now), S.soc, S, now);
+    S.history=addReading(S.history, levelEst({...S, soc:SOC_SET}, now), S.soc, S.battery, now);
     const last=S.socLog[S.socLog.length-1];
     FOLLOW=!!last && last.at===now.getTime() && deviates(last, S);
     KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
@@ -660,11 +689,37 @@ function bindInputs(){
   document.getElementById("demo").addEventListener("click",()=>{ DEMO=true; load(); });
 }
 
+// History view: days newest first, entries in order within a day
+function renderLog(){
+  const list=document.getElementById("logList"), now=new Date();
+  if (!S.history.length){ list.innerHTML=`<p class="note">Nothing yet. Drives and charging appear here once they have happened.</p>`; return; }
+  const kwh=(v, sign)=>`${v<0?"−":sign?"+":""}${Math.abs(v).toFixed(1)} kWh`;
+  const row=(when, what, sub, val="", cls="")=>`<div class="lrow"><span class="when">${when}</span><span class="what">${what}${sub?`<small>${sub}</small>`:""}</span><span class="val ${cls}">${val}</span></div>`;
+  const days=new Map();
+  for (const e of S.history){ const k=dateKey(new Date(e.at)); if (!days.has(k)) days.set(k, []); days.get(k).push(e); }
+  list.innerHTML=[...days].reverse().map(([k, es])=>{
+    const d=new Date(k+"T12:00"), diff=Math.round((startOfDay(now)-startOfDay(d))/864e5);
+    const title=diff===0 ? "Today" : diff===1 ? "Yesterday" : `${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}`;
+    return `<section class="card lday"><h2 class="sh">${title}</h2>${es.map(e=>
+      e.k==="drive" ? row(`${hhmm(e.dep)}–${hhmm(e.at)}`, `Drove ${e.km} km`, `${e.cons} kWh/100 km${e.src==="override"?" · km corrected":""}`, kwh(-e.kwh))
+      : e.k==="charge" ? row(`${hhmm(e.at)}–${hhmm(e.end)}`, "Charged", e.chosen ? "Chosen" : "Assumed from the plan", kwh(e.kwh, true), "plus")
+      : e.k==="reading" ? row(hhmm(e.at), `Reading ${Math.round(e.pct)}%`, e.estPct!=null ? `Estimated ${Math.round(e.estPct)}%` : "No estimate", e.diffKwh!=null ? kwh(e.diffKwh, true) : "")
+      : row(hhmm(e.at), `${e.how==="use"?"Estimate used":"Moved forward"} · ${Math.round(e.pct)}%`, "Estimate, not a reading")
+    ).join("")}</section>`;
+  }).join("");
+}
+
 function recompute(){
   const now=new Date();
   // Move a day-old level forward to the estimate (not while dragging, nor with example data)
   const roll=!DEMO && S.soc===SOC_SET ? rollLevel(S, now) : null;
-  if (roll){ setSoc(roll.soc, new Date(roll.socAt)); saveSettings(); }
+  if (roll){ S.history=addLevel(S.history, roll.soc, "roll", now); setSoc(roll.soc, new Date(roll.socAt)); saveSettings(); }
+  // Write what has ended since last time into the history
+  if (!DEMO){
+    const h=recordHistory(S, now), added=h.history.length!==S.history.length || JSON.stringify(h.history)!==JSON.stringify(S.history);
+    S.history=h.history; S.histAt=h.histAt;
+    if (added){ saveSettings(); if (!document.getElementById("logView").hidden) renderLog(); }
+  }
   renderSocUpdate(now);
   if (!DATA) return;
   const {hours, model}=buildHours(DATA.prices, DATA.weather, S, now);
@@ -713,25 +768,33 @@ if (typeof document!=="undefined" && document.getElementById("decision")){
   const nowMs=Date.now(), keep=dateKey(new Date(Math.max(nowMs-14*864e5, Math.min(nowMs, S.socAt||nowMs, S.readAt||nowMs))));
   for (const k of Object.keys(S.overrides)) if (k<keep) delete S.overrides[k];
   if (S.commit && S.commit.until<=nowMs) S.commit=null;   // the car has left since the choice
-  // Settings live on their own page at #settings, so the back gesture closes it
+  // Settings and history live on their own pages at #settings and #log, so the back gesture closes them
+  const PAGES={ "#settings":["settingsView","settingsTitle","openSettings"], "#log":["logView","logTitle","openLog"] };
+  let opener="openSettings";
   const views=()=>{
-    const set=location.hash==="#settings";
-    document.getElementById("mainView").hidden=set;
-    document.getElementById("settingsView").hidden=!set;
+    const page=PAGES[location.hash];
+    document.getElementById("mainView").hidden=!!page;
+    for (const [h,[view]] of Object.entries(PAGES)) document.getElementById(view).hidden=h!==location.hash;
     window.scrollTo(0,0);
-    if (set) document.getElementById("settingsTitle").focus({preventScroll:true});
+    if (location.hash==="#log") renderLog();
+    if (page){ opener=page[2]; document.getElementById(page[1]).focus({preventScroll:true}); }
   };
-  const onNav=()=>{ views(); if (location.hash!=="#settings") document.getElementById("openSettings").focus({preventScroll:true}); };
+  const onNav=()=>{ views(); if (!PAGES[location.hash]) document.getElementById(opener).focus({preventScroll:true}); };
   window.addEventListener("hashchange", onNav);
   window.addEventListener("popstate", onNav);
-  document.getElementById("closeSettings").addEventListener("click", e=>{
+  for (const b of document.querySelectorAll(".view .close")) b.addEventListener("click", e=>{
     e.preventDefault();
     // Go back if we came from the main page, so Done and the back gesture behave the same
     if (history.state && history.state.fromMain) history.back();
     else { history.replaceState(null, "", location.pathname+location.search); onNav(); }
   });
-  for (const a of document.querySelectorAll('a[href="#settings"]')) a.addEventListener("click", e=>{
-    e.preventDefault(); history.pushState({fromMain:true}, "", "#settings"); views();
+  for (const a of document.querySelectorAll('a[href="#settings"], a[href="#log"]')) a.addEventListener("click", e=>{
+    e.preventDefault(); history.pushState({fromMain:true}, "", a.getAttribute("href")); views();
+  });
+  document.getElementById("logCsv").addEventListener("click", async ()=>{
+    const csv=historyCsv(S.history), msg=document.getElementById("logCsvMsg"), out=document.getElementById("logCsvOut");
+    try { await navigator.clipboard.writeText(csv); msg.textContent=`Copied ${S.history.length} rows.`; out.hidden=true; }
+    catch(e){ out.value=csv; out.hidden=false; out.select(); msg.textContent="Couldn't copy; select the text below."; }
   });
   views();
   document.getElementById("tariffNow").textContent=`Now: ${isTariffWinter(Date.now())?"high":"low"} season.`;

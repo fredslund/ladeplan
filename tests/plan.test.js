@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -705,6 +705,81 @@ test("estimate tells chosen charging from assumed", () => {
   const { P, now } = run(NIGHT, s => { s.soc = 20; });
   P.commit = commitFrom(P, "plan", now);
   assert.ok(notePlanned([], P, now, { socAt: null }).every(w => w[2] === 1));
+});
+
+/* ---------- history ---------- */
+// Mon 19 and Tue 20 Oct 2026 are commute days (07:30–17:00, 78 km, 13.26 kWh).
+function hist(at, edit) { const s = soc(at); s.readAt = s.socAt; s.readSoc = 80; edit && edit(s); return s; }
+
+test("history records ended drives and charging once; running it again adds nothing", () => {
+  const kw = 11 * 0.9;
+  const s = hist("2026-10-18T21:00", s => { s.planned = [[ms("2026-10-19T01:00"), ms("2026-10-19T03:00")], [ms("2026-10-20T01:00"), ms("2026-10-20T02:00"), 1]]; });
+  const now = new Date("2026-10-20T12:00"), h = recordHistory(s, now);
+  assert.deepStrictEqual(h.history.map(e => [e.k, e.date || new Date(e.at).getHours()]), [["charge", 1], ["drive", "2026-10-19"], ["charge", 1]]);
+  const [c1, d, c2] = h.history;
+  assert.deepStrictEqual([c1.kwh, c1.chosen, c2.kwh, c2.chosen], [Math.round(2 * kw * 100) / 100, false, kw, true]);
+  assert.deepStrictEqual([d.km, d.kwh, d.cons, d.src, d.dep], [78, 13.26, 17, "schedule", ms("2026-10-19T07:30")]);   // Tue still away
+  assert.strictEqual(h.histAt, now.getTime());
+  const again = recordHistory({ ...s, ...h }, now);
+  assert.deepStrictEqual(again.history, h.history);
+  const eve = recordHistory({ ...s, ...h }, new Date("2026-10-20T18:00"));
+  assert.deepStrictEqual(eve.history.filter(e => e.k === "drive").map(e => e.date), ["2026-10-19", "2026-10-20"]);
+});
+
+test("history: past drives keep their km when the pattern changes; a km correction updates them", () => {
+  const s = hist("2026-10-18T21:00");
+  Object.assign(s, recordHistory(s, new Date("2026-10-19T18:00")));
+  s.kmOneWay = 50; s.pattern = [0, 0, 0, 0, 0, 0, 0];
+  Object.assign(s, recordHistory(s, new Date("2026-10-20T18:00")));
+  assert.deepStrictEqual(s.history.map(e => [e.date, e.km]), [["2026-10-19", 78]]);   // Tue isn't a commute day any more
+  s.overrides = { "2026-10-19": 100 };
+  const fixed = correctDrive(s.history, "2026-10-19", s)[0];
+  assert.deepStrictEqual([fixed.km, fixed.kwh, fixed.src, fixed.at], [100, 17, "override", ms("2026-10-19T17:00")]);
+});
+
+test("history joins a charging window split by re-planning", () => {
+  const s = hist("2026-10-18T21:00", s => { s.planned = [[ms("2026-10-19T01:00"), ms("2026-10-19T01:20")], [ms("2026-10-19T01:20"), ms("2026-10-19T01:40")]]; });
+  Object.assign(s, recordHistory(s, new Date("2026-10-19T01:30")));   // first piece only
+  s.planned.push([ms("2026-10-19T01:40"), ms("2026-10-19T02:30")]);
+  Object.assign(s, recordHistory(s, new Date("2026-10-19T03:00")));
+  const ch = s.history.filter(e => e.k === "charge");
+  assert.deepStrictEqual(ch.map(e => [e.at, e.end]), [[ms("2026-10-19T01:00"), ms("2026-10-19T02:30")]]);
+  assert.strictEqual(ch[0].kwh, Math.round(1.5 * 11 * 0.9 * 100) / 100);
+});
+
+test("history readings and levels: nudges correct the reading, old entries drop", () => {
+  const s = hist("2026-10-19T06:00"), now = new Date("2026-10-19T18:00"), est = levelEst(s, now);   // 80% − 13.26 kWh
+  let h = addReading([], est, 50, 58, now);
+  assert.deepStrictEqual([h[0].pct, h[0].estPct, h[0].diffKwh], [50, Math.round(est.kwh / 58 * 1e4) / 100, Math.round((29 - est.kwh) * 100) / 100]);
+  h = addReading(h, null, 52, 58, new Date("2026-10-19T18:05"));
+  assert.strictEqual(h.length, 1);
+  assert.deepStrictEqual([h[0].pct, h[0].diffKwh], [52, Math.round(58 * (52 - h[0].estPct)) / 100]);
+  h = addLevel(h, 51.234, "use", new Date("2026-10-19T18:30"));
+  assert.deepStrictEqual(h.map(e => e.k), ["reading", "level"]);
+  assert.strictEqual(h[1].pct, 51.23);
+  assert.strictEqual(addReading(h, null, 40, 58, new Date("2026-10-19T18:32")).length, 3);   // last entry isn't a reading
+  assert.strictEqual(addLevel(h, 40, "roll", new Date("2027-03-01T12:00")).length, 1);   // over 120 days old: dropped
+});
+
+test("history first run fills in from socLog, and settings validate it", () => {
+  const s = hist("2026-10-19T06:00"), now = new Date("2026-10-19T18:00");
+  s.socLog = logReading([], socEstimate(s, now), 50, s, now);
+  const h = recordHistory(s, new Date("2026-10-19T19:00")).history;
+  assert.deepStrictEqual(h.map(e => e.k), ["drive", "reading"]);
+  assert.deepStrictEqual([h[1].pct, h[1].diffKwh], [50, Math.round((29 - (46.4 - 13.26)) * 100) / 100]);
+  const v = stored({ history: [{ k: "drive", at: 1 }, { k: "x", at: 1 }, { k: "level" }, null], histAt: "x" });
+  assert.deepStrictEqual([v.history.length, v.histAt], [1, null]);
+  assert.deepStrictEqual([stored({}).history, stored({}).histAt], [[], null]);
+});
+
+test("history CSV has one row per entry", () => {
+  const s = hist("2026-10-18T21:00", s => { s.planned = [[ms("2026-10-19T01:00"), ms("2026-10-19T02:00"), 1]]; });
+  const h = addReading(recordHistory(s, new Date("2026-10-19T18:00")).history, null, 61, 58, new Date("2026-10-19T19:00"));
+  assert.deepStrictEqual(historyCsv(h).split("\n"), [
+    "start,end,type,km,kwh,pct,est_pct,note",
+    "2026-10-19 01:00,2026-10-19 02:00,charge,,9.9,,,chosen",
+    "2026-10-19 07:30,2026-10-19 17:00,drive,78,-13.26,,,\"17 kWh/100 km, schedule\"",
+    "2026-10-19 19:00,,reading,,,61,,"]);
 });
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");

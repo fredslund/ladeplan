@@ -20,10 +20,13 @@ const DEF = {
   readAt: null, readSoc: null,         // the last reading of the car (slider moved), for the consumption log
   planned: [],                         // [start,end] ms of charging windows shown since then (assumed done)
   socLog: [],                          // readings after drives, for tuning consumption later
+  history: [], histAt: null,           // what happened (drives, charging, readings, level set), see recordHistory()
   commit: null                         // session choice: { kind: plan|manual|none, until, windows, limit, at }
 };
 const STORE = "ladeplan.v1";
 const LOG_MAX = 60;
+const HIST_DAYS = 120;
+const HIST_KINDS = ["drive","charge","reading","level"];
 const CAR_MAX = 24;
 // Allowed range per numeric setting; out-of-range values are clamped, non-numbers fall back to the default.
 const LIMITS = {
@@ -72,6 +75,8 @@ function settingsFrom(raw){
   s.commit = c && ["plan","manual","none"].includes(c.kind) && num(c.until) && num(c.at) && Array.isArray(c.windows)
     && c.windows.every(w=>win(w) && w.length===2) && (c.kind==="none" || (num(c.limit) && c.limit>=50 && c.limit<=100))
     ? { kind:c.kind, until:c.until, windows:c.windows, limit:c.kind==="none" ? null : c.limit, at:c.at } : null;
+  s.history=Array.isArray(s.history) ? s.history.filter(e=>e && HIST_KINDS.includes(e.k) && num(e.at)).slice(-2000) : [];
+  if (!num(s.histAt)) s.histAt=null;
   s.socLog=Array.isArray(s.socLog) ? s.socLog.filter(e=>e && num(e.at) && num(e.from) && num(e.km) && num(e.predKwh) && num(e.startKwh)).slice(-LOG_MAX) : [];
   return s;
 }
@@ -423,6 +428,73 @@ function deviates(e, s){
   return e.leg!=="out" && e.leg!=="back" && e.actKwh!=null && e.predKwh>0 && Math.abs(e.actKwh-e.predKwh)>=0.05*s.battery && Math.abs(e.actKwh/e.predKwh-1)>0.25;
 }
 
+/* ---------- history ---------- */
+// What the app assumes happened, written once it's in the past and not recalculated afterwards (so changing the
+// weekly pattern doesn't rewrite past days). Entries, sorted by `at` (ms), kept HIST_DAYS:
+//   drive   { at: back, dep, date, km, kwh, cons, src: schedule|override }  the day's round trip, once it has ended
+//   charge  { at: start, end, kwh, chosen }  a charging window the app showed (assumed) or the user chose
+//   reading { at, pct, estPct, diffKwh }     a level set from the car, vs. the estimate then (diff = car − estimate)
+//   level   { at, pct, how: use|roll }       the estimate taken as the level ("Use", or moved forward by rollLevel())
+const histSort = (h, t) => h.filter(e=>e.at>=t-HIST_DAYS*DAY).sort((a,b)=>a.at-b.at);
+function driveEntry(day, s){
+  const key=dateKey(day), km=kmOn(day, s), cons=consFor(day, s);
+  return { k:"drive", at:atTime(day,s.home).getTime(), dep:atTime(day,s.depart).getTime(), date:key, km, kwh:r2(km*cons/100), cons,
+    src: s.overrides[key]!=null ? "override" : "schedule" };
+}
+// Add the drives and charging windows that have ended since s.histAt (on the first run: since the oldest stored
+// reading, level or window, max 14 days, plus the readings in socLog). Running it twice adds nothing.
+function recordHistory(s, now){
+  const t=now.getTime(), hist=s.history.map(h=>({...h}));   // copies: a charge entry may be extended below
+  let from=s.histAt;
+  if (!(from>0)){
+    from=Math.max(t-14*DAY, Math.min(t, s.readAt||t, s.socAt||t, ...s.socLog.map(e=>e.from), ...s.planned.map(w=>w[0])));
+    for (const e of s.socLog) if (e.actKwh!=null && e.at>=from)
+      hist.push({ k:"reading", at:e.at, pct:r2((e.startKwh-e.actKwh)/s.battery*100), estPct:r2((e.startKwh-e.predKwh)/s.battery*100), diffKwh:r2(e.predKwh-e.actKwh) });
+  }
+  from=Math.max(from, t-HIST_DAYS*DAY);
+  for (let day=startOfDay(new Date(from)); day.getTime()<=t; day=addDays(day,1)){
+    const back=atTime(day,s.home).getTime(), key=dateKey(day);
+    if (kmOn(day,s)<=0 || back<=from || back>t || hist.some(h=>h.k==="drive" && h.date===key)) continue;
+    hist.push(driveEntry(day, s));
+  }
+  // The plan re-clips a running window on every recompute, so `planned` holds it in pieces: join touching ones
+  const kw=s.chargerKw*s.effPct/100;
+  for (const [a,b,c] of [...s.planned].sort((x,y)=>x[0]-y[0])){
+    if (b>t || b<=from) continue;
+    const ch=hist.filter(h=>h.k==="charge");
+    if (ch.some(h=>h.at<=a && h.end>=b)) continue;
+    const prev=ch.find(h=>Math.abs(h.end-a)<1000 && h.chosen===(c===1));
+    if (prev){ prev.end=b; prev.kwh=r2((b-prev.at)/H*kw); }
+    else hist.push({ k:"charge", at:a, end:b, kwh:r2((b-a)/H*kw), chosen:c===1 });
+  }
+  return { history:histSort(hist, t), histAt:t };
+}
+// A level set from the car, against the estimate before it (est from levelEst(), or null). A change within 10
+// minutes of the last entry, if that is a reading, corrects it (like logReading()).
+function addReading(history, est, pct, B, now){
+  const t=now.getTime(), last=history[history.length-1];
+  if (last && last.k==="reading" && t-last.at<10*60e3)
+    return [...history.slice(0,-1), {...last, at:t, pct, diffKwh:last.estPct==null ? null : r2(B*(pct-last.estPct)/100)}];
+  return histSort([...history, { k:"reading", at:t, pct, estPct:est ? r2(est.kwh/B*100) : null, diffKwh:est ? r2(B*pct/100-est.kwh) : null }], t);
+}
+function addLevel(history, pct, how, now){
+  return histSort([...history, { k:"level", at:now.getTime(), pct:r2(pct), how }], now.getTime());
+}
+// After a km correction for a day: its drive entry (if recorded) takes the new distance.
+function correctDrive(history, key, s){
+  return history.map(e=>e.k==="drive" && e.date===key ? {...driveEntry(new Date(key+"T12:00"), s), at:e.at, dep:e.dep} : e);
+}
+// One row per entry, for checking in a spreadsheet.
+function historyCsv(history){
+  const ts=t=>`${dateKey(new Date(t))} ${hhmm(t)}`;
+  const v=x=>{ const q=x==null ? "" : String(x); return /[",\n]/.test(q) ? `"${q.replace(/"/g,'""')}"` : q; };
+  const rows=history.map(e=>e.k==="drive" ? [ts(e.dep), ts(e.at), "drive", e.km, -e.kwh, "", "", `${e.cons} kWh/100 km, ${e.src}`]
+    : e.k==="charge" ? [ts(e.at), ts(e.end), "charge", "", e.kwh, "", "", e.chosen ? "chosen" : "assumed"]
+    : e.k==="reading" ? [ts(e.at), "", "reading", "", e.diffKwh, e.pct, e.estPct, ""]
+    : [ts(e.at), "", "level", "", "", e.pct, "", e.how]);
+  return [["start","end","type","km","kwh","pct","est_pct","note"], ...rows].map(r=>r.map(v).join(",")).join("\n");
+}
+
 /* ---------- decision card ---------- */
 const fmtKr = v => v.toFixed(2).replace(".",",");
 const pct = (kwh,B) => Math.round(kwh/B*100);
@@ -617,5 +689,5 @@ export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
   SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, priceRating, kmOn,
-  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, logReading, relogKm, deviates, limitFor, commitFrom
+  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, limitFor, commitFrom
 };
