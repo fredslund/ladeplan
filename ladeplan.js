@@ -366,11 +366,20 @@ function drivesDone(s, from, to){
 // Charging windows the app has shown, kept so a later estimate can assume they were used. The part of each
 // stored window before `now` stays (back to socAt or the last reading, max 14 days); from `now` on, the current plan's windows before the
 // next departure replace them. Windows the user chose (P.commit) are marked with a third element 1.
+// A running window is cut at `now` on every recompute; touching windows of the same kind are joined again, so it
+// stays one window (recordHistory() records it whole once it ends).
 function notePlanned(planned, P, now, s){
   const t=now.getTime(), from=Math.max(Math.min(s.socAt||t, s.readAt||t), t-14*DAY), leave=P.nextDrive ? P.nextDrive.t : Infinity;
   const past=planned.filter(([a,b])=>a<t && b>from).map(([a,b,c])=>c ? [a, Math.min(b,t), 1] : [a, Math.min(b,t)]);
   const chosen=b=>P.commit && b.start<P.commit.until;
-  return [...past, ...P.blocks.filter(b=>b.start<leave).map(b=>[Math.round(b.start), Math.round(b.end), ...(chosen(b)?[1]:[])])];
+  const all=[...past, ...P.blocks.filter(b=>b.start<leave).map(b=>[Math.round(b.start), Math.round(b.end), ...(chosen(b)?[1]:[])])];
+  const out=[];
+  for (const w of all.sort((x,y)=>x[0]-y[0])){
+    const last=out[out.length-1];
+    if (last && Math.abs(w[0]-last[1])<1000 && last[2]===w[2]) last[1]=Math.max(last[1], w[1]);
+    else out.push([...w]);
+  }
+  return out;
 }
 // Battery level now, from the level set at s.socAt, plus planned charging since then (assumes the plan was
 // followed), minus the drives (legs, see drivesDone()) since then at the season's consumption. null if socAt

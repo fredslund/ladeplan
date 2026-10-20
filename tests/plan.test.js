@@ -747,6 +747,33 @@ test("history joins a charging window split by re-planning", () => {
   assert.strictEqual(ch[0].kwh, Math.round(1.5 * 11 * 0.9 * 100) / 100);
 });
 
+test("history records a whole charging session when the page is opened during it", () => {
+  // Same order as recompute(): record the history, then plan and note the windows shown
+  const s = hist("2026-10-19T19:00", s => { s.soc = 20; s.readSoc = 20; });
+  const d = demoData(new Date("2026-10-19T20:00"));
+  for (const at of ["2026-10-19T20:00", "2026-10-19T22:10", "2026-10-19T23:20", "2026-10-20T00:30", "2026-10-20T01:40", "2026-10-20T03:00", "2026-10-20T05:00", "2026-10-20T07:00"]) {
+    const now = new Date(at);
+    Object.assign(s, recordHistory(s, now));
+    const { hours } = buildHours(d.prices, d.weather, s, now);
+    s.planned = notePlanned(s.planned, plan(hours, s, now), now, s);
+  }
+  assert.ok(s.planned.every((w, i) => i === 0 || w[0] - s.planned[i - 1][1] >= 1000), "no touching pieces in planned");
+  const ended = s.planned.filter(w => w[1] <= ms("2026-10-20T07:00"));
+  assert.ok(ended.length > 0);
+  const ch = s.history.filter(e => e.k === "charge");
+  assert.deepStrictEqual(ch.map(e => [e.at, e.end]), ended.map(w => [w[0], w[1]]));
+  assert.ok(Math.abs(ch.reduce((a, e) => a + e.kwh, 0) - ended.reduce((a, w) => a + (w[1] - w[0]) / 36e5 * 11 * 0.9, 0)) < 0.05);
+});
+
+test("notePlanned joins touching windows of the same kind", () => {
+  const s = soc("2026-10-19T18:00"), now = new Date("2026-10-19T21:00");
+  const old = [[ms("2026-10-19T19:00"), ms("2026-10-19T20:00")], [ms("2026-10-19T20:00"), ms("2026-10-19T21:30")], [ms("2026-10-19T21:30"), ms("2026-10-19T22:00"), 1]];
+  const P = { nextDrive: { t: ms("2026-10-20T07:30") }, blocks: [{ start: now.getTime(), end: ms("2026-10-19T23:00") }] };
+  assert.deepStrictEqual(notePlanned(old, P, now, s), [[ms("2026-10-19T19:00"), ms("2026-10-19T23:00")]]);
+  P.commit = { until: ms("2026-10-20T07:30") };   // chosen now: kept apart from the assumed part
+  assert.deepStrictEqual(notePlanned(old, P, now, s), [[ms("2026-10-19T19:00"), ms("2026-10-19T21:00")], [ms("2026-10-19T21:00"), ms("2026-10-19T23:00"), 1]]);
+});
+
 test("history readings and levels: nudges correct the reading, old entries drop", () => {
   const s = hist("2026-10-19T06:00"), now = new Date("2026-10-19T18:00"), est = levelEst(s, now);   // 80% − 13.26 kWh
   let h = addReading([], est, 50, 58, now);
