@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -381,6 +381,42 @@ test("price rating thresholds", () => {
   assert.strictEqual(priceRating(3.5, n).level, "typical");   // beats 4/7
   assert.strictEqual(priceRating(5.5, n).level, "pricey");    // beats 2/7
   assert.strictEqual(priceRating(1, [1, 2]), null);           // too little history
+});
+
+test("cheap limit: the price that would rate cheap against recent days", () => {
+  const now = new Date("2026-10-19T21:00"), s = clone(DEF);
+  const prices = dayHistory(now, s);
+  const k = Math.ceil(58 * 0.7 / 9.9), days = recentDays(prices, s, now, k);
+  assert.strictEqual(cheapLimit(prices, s, now), days[2]);   // beats 5 of 7
+  assert.strictEqual(priceRating(days[2] - 1e-6, days).level, "cheap");
+  assert.strictEqual(cheapLimit(new Map(), s, now), null);
+});
+
+test("top-up fills known cheap hours to the charge limit, never forecast hours", () => {
+  const { P: base, s, hours, now } = run("2026-10-19T21:00", s => { s.soc = 20; });
+  const known = hours.filter(h => !h.fc && h.t >= now.getTime() - 3600e3);
+  const below = Math.max(...known.map(h => h.price)) + 0.01;   // every known hour counts as cheap
+  const P = plan(hours, s, now, below);
+  const kwh = p => p.slots.reduce((a, sl) => a + sl.charge, 0);
+  assert.ok(kwh(P) > kwh(base) + 1, `${kwh(P)} vs ${kwh(base)}`);
+  assert.ok(Math.max(...P.slots.map(sl => sl.lvl)) <= 58 * s.maxSoc / 100 + 0.05);
+  assert.ok(P.slots.every(sl => !sl.fill || !sl.fc));
+  assert.deepStrictEqual(plan(hours, s, now, 0).blocks, base.blocks);   // nothing that cheap: unchanged
+});
+
+test("decision card says how much is a top-up", () => {
+  const { s, hours, now } = run("2026-10-19T21:00", s => { s.soc = 20; });
+  const below = Math.max(...hours.filter(h => !h.fc).map(h => h.price)) + 0.01;
+  const card = decide(plan(hours, s, now, below), now, s, null);
+  assert.ok(/(the rest|kWh of it) tops up to 80% while the price is low/.test(card.sub), card.sub);
+  const opt = decide(plan(hours, { ...s, soc: 70 }, now, below), now, { ...s, soc: 70 }, null);
+  assert.ok(opt.sub.includes("but the price is low, so it tops up"), opt.sub);
+});
+
+test("fillCheap setting defaults on and must be a boolean", () => {
+  assert.strictEqual(stored({}).fillCheap, true);
+  assert.strictEqual(stored({ fillCheap: false }).fillCheap, false);
+  assert.strictEqual(stored({ fillCheap: "no" }).fillCheap, true);
 });
 
 test("decision card rates the window against recent days", () => {
