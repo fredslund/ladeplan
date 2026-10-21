@@ -7,6 +7,7 @@ const DEF = {
   soc: 50, kmOneWay: 39, depart: "07:30", home: "17:00",
   pattern: [1,1,1,1,0,0,0],           // Mon..Sun, 1 = commute
   battery: 58, reserve: 10, maxSoc: 80, chargerKw: 11, effPct: 90, cheapFill: 0,
+  fillCheap: true,                     // top up to the charge limit in known hours that are cheap vs. recent days
   oneWindowKr: 5,                      // accept up to this many kr extra to charge in one timer window
   cons: { s: 14, h: 17, w: 20 },        // kWh/100 km: summer, shoulder, winter
   seasons: "wwwhhssshhww",             // Jan..Dec
@@ -64,6 +65,7 @@ function settingsFrom(raw){
   for (const k in LIMITS) setPath(s, k, clampSetting(k, getPath(s,k)));
   s.car = typeof s.car==="string" ? s.car.trim().slice(0, CAR_MAX) : DEF.car;
   if (!["DK1","DK2"].includes(s.area)) s.area = DEF.area;
+  if (typeof s.fillCheap!=="boolean") s.fillCheap = DEF.fillCheap;
   const num=Number.isFinite;
   if (!num(s.socAt)) s.socAt=null;
   // Before readAt existed, every level set counted as a reading
@@ -224,7 +226,8 @@ function drivesFor(s, now, horizonEnd){
   return ev;
 }
 
-function plan(hours, s, now){
+// fillBelow (kr/kWh, from cheapLimit()): also top up to the charge limit in known-price hours below it.
+function plan(hours, s, now, fillBelow=null){
   const nowMs=now.getTime(), B=s.battery, eff=s.effPct/100;
   // Start from the level now: the level set, plus charging planned and drives made since (levelEst())
   const est=levelEst(s, now), res=B*s.reserve/100, soc0=est ? est.kwh : B*s.soc/100;
@@ -285,11 +288,12 @@ function plan(hours, s, now){
       ev.short = def>0.05 ? def : 0;
     }
   });
-  if (s.cheapFill>0){
-    for (const i of order(slots.map((_,i)=>i).filter(i=>free(i) && slots[i].price<=s.cheapFill))){
-      const amt=Math.min(slots[i].capK-slots[i].charge, headroom(i,B*s.maxSoc/100));
-      if (amt>0.01) slots[i].charge+=amt;
-    }
+  // Top-ups: below the always-fill price, or (known prices only) cheap compared with recent days.
+  // sl.fill keeps the extra energy so the card can say why it charges more than needed.
+  const cheap=sl=>(s.cheapFill>0 && sl.price<=s.cheapFill) || (fillBelow!=null && !sl.fc && sl.price<fillBelow);
+  for (const i of order(slots.map((_,i)=>i).filter(i=>free(i) && cheap(slots[i])))){
+    const amt=Math.min(slots[i].capK-slots[i].charge, headroom(i,B*s.maxSoc/100));
+    if (amt>0.01){ slots[i].charge+=amt; slots[i].fill=amt; }
   }
   // Prices are fixed per hour, so only the energy in each hour matters. In each run of consecutive charging
   // hours, move charge so at most one hour is partly used and it sits at one end of the run (whichever is
@@ -559,6 +563,14 @@ function recentDays(prices, s, now, k, days=7){
   }
   return out.sort((a,b)=>a-b);
 }
+// Price below which an hour counts as cheap for a top-up: it would rate "cheap" (beat at least 70% of recent
+// days) against the cheapest home hours of each day, k = hours to charge from the reserve to the charge limit.
+// null with under 3 days of history.
+function cheapLimit(prices, s, now){
+  const k=Math.max(1, Math.ceil(s.battery*(s.maxSoc-s.reserve)/100/(s.chargerKw*s.effPct/100)));
+  const days=recentDays(prices, s, now, k), n=days.length;
+  return n<3 ? null : days[n-Math.ceil(0.7*n-1e-9)];
+}
 // Rank price x against recent days: "cheap" if it beats at least 70% of them, "pricey" if at most 30%.
 function priceRating(x, days){
   const n=days.length; if (n<3) return null;
@@ -655,6 +667,8 @@ function decide(P, now, s, prices){
   const windows=(sess.length>1 ? ` Split into ${sess.length} windows, see the plan below.` : "")
     + (before.length>sess.length ? ` ${before.length-sess.length} more before you leave ${day(leaveAt)} ${hhmm(leaveAt)}.` : "");
   const must=(P.mustKwh||0)>0.05 && nextDrive;
+  // Grid energy before the car leaves that is only a top-up (cheap price), not needed for a drive
+  const fillGrid=P.slots.reduce((a,sl)=>a+(sl.fill && sl.t<leaveAt ? sl.fill : 0),0)/(s.effPct/100);
   // Compare this session's average with the same number of cheapest home hours on recent days.
   const k=Math.max(1, sess.reduce((a,b)=>a+(b.hours||Math.round((b.end-b.start)/H)),0));
   const r = home && prices ? priceRating(cost/kwh, recentDays(prices, s, now, k)) : null;
@@ -687,13 +701,17 @@ function decide(P, now, s, prices){
     const p=pct(P.noChargeLvl,P.B), needGrid=P.mustKwh/(s.effPct/100), planned=before.reduce((a,b)=>a+b.kwh,0);
     const without = p<=0 ? `Without charging you'd run out before getting home from ${day(nextDrive.t)}'s drive.`
       : `Without charging you'd get home from ${day(nextDrive.t)}'s drive with ${p}%, below your ${s.reserve}% reserve.`;
-    const extra = planned-needGrid>1 ? ` At least ${needGrid.toFixed(1)} kWh is needed; the rest is cheaper before you leave than after.` : "";
+    // The rest is cheaper now than after leaving (later drives), a top-up while it's cheap, or both
+    const topTo=`tops up to ${limitFor(lastW.lvlEnd,P.B)}% while the price is low`, allTop=fillGrid>planned-needGrid-1;
+    const extra = planned-needGrid>1 ? ` At least ${needGrid.toFixed(1)} kWh is needed; the rest ${allTop ? topTo : "is cheaper before you leave than after"}.` : "";
+    const top = fillGrid>1 && !allTop ? ` ${fillGrid.toFixed(1)} kWh of it ${topTo}.` : "";
     return { cls:"must", lvl:`Needed for ${day(nextDrive.t)}`, title:`Charge ${when(first.start)}`, big, rate, setup, choose:true,
-      sub: without + extra + windows + (fc ? fcNote : ` Average ${avg} kr/kWh.`) };
+      sub: without + extra + top + windows + (fc ? fcNote : ` Average ${avg} kr/kWh.`) };
   }
   if (home && !fc) return { cls:"", lvl: rate && rate.level==="cheap" ? "Optional · good price" : "Optional · cheapest ahead",
     title:`Charge ${when(first.start)}`, big, rate, setup, choose:true,
-    sub: (nextDrive ? `Not needed for ${day(nextDrive.t)} yet, but this is the cheapest time in the plan.` : "Below your always-fill price.")
+    sub: (fillGrid>before.reduce((a,b)=>a+b.kwh,0)/2 ? (nextDrive ? `Not needed for ${day(nextDrive.t)} yet, but the price is low, so it tops up.` : "The price is low, so it tops up.")
+      : nextDrive ? `Not needed for ${day(nextDrive.t)} yet, but this is the cheapest time in the plan.` : "Below your always-fill price.")
       + ` Average ${avg} kr/kWh.` + windows };
   if (home) return { cls:"fc", lvl:"Forecast", title:`Probably charge ${when(first.start)}`, big, rate, setup, choose:true,
     sub:`Not needed yet, but this looks like the cheapest time. Expected ≈ ${avg} kr/kWh.` + windows + fcNote };
@@ -730,6 +748,6 @@ function committed(P, now, s, short, nextDrive, day, when){
 export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
-  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, priceRating, kmOn,
+  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, cheapLimit, priceRating, kmOn,
   buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom
 };

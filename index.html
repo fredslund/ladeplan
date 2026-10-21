@@ -102,6 +102,8 @@ details[open] summary::after{content:"–"}
 .grid2{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px 14px}
 .field{display:flex;flex-direction:column;gap:3px;min-width:0}
 .field span{font-size:12.5px;color:var(--muted)}
+.check{display:flex;align-items:flex-start;gap:8px;margin-top:12px;font-size:14px}
+.check input{width:18px;height:18px;margin:1px 0 0;flex:none;accent-color:var(--charge)}
 /* 16px minimum: iOS Safari zooms in on focus for smaller text in form fields */
 input[type=number],input[type=time],input[type=text],select{font:16px var(--mono);color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:7px 8px;width:100%}
 input:focus-visible,select:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--charge);outline-offset:2px}
@@ -262,6 +264,7 @@ a.inl{color:var(--known)}
         <label class="field"><span>Always fill below (kr/kWh)</span><input type="number" id="cheapFill" data-k="cheapFill" step="0.05"></label>
         <label class="field"><span>One timer window if extra cost under (kr)</span><input type="number" id="oneWindowKr" data-k="oneWindowKr" step="1"></label>
       </div>
+      <label class="check"><input type="checkbox" id="fillCheap" data-k="fillCheap"> Top up to the charge limit when the price is cheap compared with the last 7 days</label>
       <p class="note">The charge limit can be exceeded if a long trip needs it. Set "always fill" to 0 to turn it off. Charging is planned as one timer window per session unless splitting saves more than the amount set.</p>
       <p class="label" style="margin:6px 0 0">Consumption by season, kWh/100 km</p>
       <div class="grid3">
@@ -315,7 +318,7 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand,
+  buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand,
   recordHistory, addReading, addLevel, correctDrive, historyCsv
 } from "./ladeplan.js";
 
@@ -684,10 +687,10 @@ function renderHeader(){
 function bindInputs(){
   document.querySelectorAll("[data-k]").forEach(el=>{
     const k=el.dataset.k;
-    el.value=getPath(S, k);
+    if (el.type==="checkbox") el.checked=getPath(S, k); else el.value=getPath(S, k);
     if (LIMITS[k]){ el.min=LIMITS[k][0]; el.max=LIMITS[k][1]; }
     el.addEventListener("change",()=>{
-      let v = el.value;
+      let v = el.type==="checkbox" ? el.checked : el.value;
       if (el.type==="number"){
         // An emptied field keeps the previous value instead of becoming 0
         if (v.trim()==="" || !isFinite(Number(v))){ el.value=getPath(S,k); return; }
@@ -760,7 +763,8 @@ function recompute(){
   const {hours, model}=buildHours(DATA.prices, DATA.weather, S, now);
   MODEL=model;
   // While the slider is dragged, its value is the level now (no drives since to subtract)
-  const P=plan(hours, S.soc!==SOC_SET ? {...S, socAt:now.getTime()} : S, now);
+  const fill=S.fillCheap ? cheapLimit(DATA.prices, S, now) : null;
+  const P=plan(hours, S.soc!==SOC_SET ? {...S, socAt:now.getTime()} : S, now, fill);
   // Remember the charging shown, so the next estimate after a drive can assume it was done
   if (!DEMO){
     const pl=notePlanned(S.planned, P, now, S);
