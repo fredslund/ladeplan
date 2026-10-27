@@ -6,7 +6,7 @@ A personal EV charging planner (VW ID.3, home charger, price area DK1). It answe
 
 Two static files, no build step and no backend. Everything runs in the browser.
 
-- `ladeplan.js`: ES module with all pure logic (settings defaults, limits and migration via `settingsFrom()`, time helpers, tariffs, the forecast model, `parsePrices()`, `plan()`, `decide()`, `demoData()`). No DOM, no `localStorage`, no network; the tests import it directly.
+- `ladeplan.js`: ES module with all pure logic (settings defaults, limits and migration via `settingsFrom()`, time helpers, commute helpers (`patternKm()`, `kmOn()`, `commuteOn()` for km and departure/return times, `kwhFor()` for energy; use these rather than reading `s.depart`/`s.home` directly), tariffs, the forecast model, `parsePrices()`, `plan()`, `decide()`, `demoData()`). No DOM, no `localStorage`, no network; the tests import it directly.
 - `index.html`: markup, CSS and a `<script type="module">` that imports `ladeplan.js` and does storage, fetching and rendering.
 - `package.json` only sets `"type": "module"` (so Node treats the `.js` files as ES modules) and an `npm test` alias.
 

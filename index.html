@@ -317,8 +317,8 @@ a.inl{color:var(--known)}
 <script type="module">
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
-  monIdx, startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand,
+  startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
+  buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, patternKm, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand,
   recordHistory, addReading, addLevel, correctDrive, historyCsv
 } from "./ladeplan.js";
 
@@ -375,7 +375,7 @@ function setSoc(v, now, reading){
   document.getElementById("soc").value=Math.round(v); document.getElementById("socOut").textContent=Math.round(v)+"%";
 }
 function setKm(key, v){
-  const day=new Date(key+"T12:00"), pat=S.pattern[monIdx(day)]?2*S.kmOneWay:0;
+  const pat=patternKm(new Date(key+"T12:00"), S);
   if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
   S.history=correctDrive(S.history, key, S);
 }
@@ -397,6 +397,11 @@ function renderSocUpdate(now){
   const set=from=>dateKey(new Date(from))===dateKey(now) ? hhmm(from) : `${DOW[new Date(from).getDay()]} ${hhmm(from)}`;
   const charged=e=>e.chargedKwh>0.05 ? ` + ${e.chargedKwh.toFixed(1)} kWh charging (${e.chosenKwh>=e.chargedKwh-0.05 ? "chosen" : e.chosenKwh>0.05 ? `${e.chosenKwh.toFixed(1)} chosen, rest assumed from the plan` : "assumed from the plan"})` : "";
   const useBtn=(e, extra="")=>`<div class="row"><button type="button" class="btn" id="socUse">Use ${e.pct}%</button>${extra}</div>`;
+  // "Use" accepts the estimate: not a reading, so the next reading is still logged from the last one
+  const bindUse=e=>{ document.getElementById("socUse").onclick=()=>{
+    const t=new Date(), v=e.kwh/e.B*100;
+    ASK=null; KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
+  }; };
   if (est){
     const lastTrip=est.trips[est.trips.length-1], half=lastTrip.leg!=="day";
     const days=est.trips.length>1 ? ` (${est.trips.length} drives, ${est.trips.map(t=>DOW[new Date(t.back).getDay()]).join(", ")})`
@@ -405,11 +410,7 @@ function renderSocUpdate(now){
       <p class="note">${from(est)}${charged(est)} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). The plan uses this; or set the slider to what the car shows.</p>
       ${useBtn(est, `<button type="button" class="linkbtn" id="socKm" aria-expanded="${KM_OPEN}">Edit km</button>`)}
       <div ${KM_OPEN?"":"hidden"}>${kmField(lastTrip.key, half)}</div>${ageNote}`;
-    // "Use" accepts the estimate: not a reading, so the next reading is still logged from the last one
-    document.getElementById("socUse").onclick=()=>{
-      const t=new Date(), v=est.kwh/est.B*100;
-      ASK=null; KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
-    };
+    bindUse(est);
     document.getElementById("socKm").onclick=()=>{ KM_OPEN=!KM_OPEN; renderSocUpdate(new Date()); if (KM_OPEN) document.getElementById("socKmIn").focus(); };
   }
   else if (ASK){
@@ -447,10 +448,7 @@ function renderSocUpdate(now){
     box.innerHTML=`<p><b>${running?"Charging":"Charged?"}</b> Estimated <span class="num">${lv.pct}%</span>${running?" so far":""}</p>
       <p class="note">${from(lv)}${charged(lv)}. The plan uses this; or set the slider to what the car shows.</p>
       ${useBtn(lv)}${ageNote}`;
-    document.getElementById("socUse").onclick=()=>{
-      const t=new Date(), v=lv.kwh/lv.B*100;
-      ASK=null; KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
-    };
+    bindUse(lv);
   }
   else if (age) box.innerHTML=ageNote;
   else { box.hidden=true; box.innerHTML=""; return; }
@@ -622,7 +620,7 @@ function renderTrips(now){
   const box=document.getElementById("trips"); box.innerHTML="";
   for (let i=0;i<7;i++){
     const day=addDays(startOfDay(now),i), key=dateKey(day);
-    const pat=S.pattern[monIdx(day)]?2*S.kmOneWay:0, ov=S.overrides[key];
+    const pat=patternKm(day, S), ov=S.overrides[key];
     // An override that matches the weekly pattern changes nothing for now, so it isn't shown as changed
     const changed=ov!=null && ov!==pat;
     const row=document.createElement("div"); row.className="trip";

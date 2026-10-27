@@ -208,20 +208,22 @@ function buildHours(prices, weather, s, now){
   return { hours, model };
 }
 
+// Round-trip km from the weekly pattern alone (0 = car home all day)
+function patternKm(day, s){ return s.pattern[monIdx(day)] ? 2*s.kmOneWay : 0; }
 // Round-trip km on a date: per-date override, else the weekly pattern (0 = car home all day)
-function kmOn(day, s){ const key=dateKey(day); return s.overrides[key]!=null ? s.overrides[key] : (s.pattern[monIdx(day)] ? 2*s.kmOneWay : 0); }
+function kmOn(day, s){ const key=dateKey(day); return s.overrides[key]!=null ? s.overrides[key] : patternKm(day, s); }
+// The commute on a date: round-trip km, departure and return (ms). The car is away between dep and back if km>0.
+function commuteOn(day, s){ return { key:dateKey(day), km:kmOn(day, s), dep:atTime(day,s.depart).getTime(), back:atTime(day,s.home).getTime() }; }
+// Energy for km driven on a date, at that date's season consumption
+const kwhFor = (km, day, s) => km*consFor(day, s)/100;
 
 function drivesFor(s, now, horizonEnd){
   const ev=[];
-  const need = (km, day) => km*consFor(day, s)/100;
   for (let i=0;i<4;i++){
-    const day=addDays(startOfDay(now),i), key=dateKey(day);
-    const km=kmOn(day, s);
-    if (km<=0) continue;
-    const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
-    if (dep>=horizonEnd) continue;
-    if (dep>now.getTime()) ev.push({t:dep, back, km, need:need(km,day), key, check:true});
-    else if (back>now.getTime()) ev.push({t:back, back, km:km/2, need:need(km,day)/2, key, check:false, returning:true});
+    const day=addDays(startOfDay(now),i), {key, km, dep, back}=commuteOn(day, s);
+    if (km<=0 || dep>=horizonEnd) continue;
+    if (dep>now.getTime()) ev.push({t:dep, back, km, need:kwhFor(km,day,s), key, check:true});
+    else if (back>now.getTime()) ev.push({t:back, back, km:km/2, need:kwhFor(km,day,s)/2, key, check:false, returning:true});
   }
   return ev;
 }
@@ -358,12 +360,11 @@ const DAY = 864e5;
 function drivesDone(s, from, to){
   const out=[];
   for (let day=startOfDay(new Date(from)); day.getTime()<=to; day=addDays(day,1)){
-    const km=kmOn(day, s); if (km<=0) continue;
-    const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
+    const {key, km, dep, back}=commuteOn(day, s); if (km<=0) continue;
     const leg = dep>from && back<=to ? "day" : dep<=from && back>from && back<=to ? "back" : dep>from && dep<=to && back>to ? "out" : null;
     if (!leg) continue;
-    const part=leg==="day" ? 1 : 0.5, cons=consFor(day, s);
-    out.push({ key:dateKey(day), back, leg, km:km*part, cons, kwh:km*part*cons/100 });
+    const part=leg==="day" ? 1 : 0.5;
+    out.push({ key, back, leg, km:km*part, cons:consFor(day, s), kwh:kwhFor(km*part, day, s) });
   }
   return out;
 }
@@ -459,8 +460,8 @@ function deviates(e, s){
 //   level   { at, pct, how: use|roll }       the estimate taken as the level ("Use", or moved forward by rollLevel())
 const histSort = (h, t) => h.filter(e=>e.at>=t-HIST_DAYS*DAY).sort((a,b)=>a.at-b.at);
 function driveEntry(day, s){
-  const key=dateKey(day), km=kmOn(day, s), cons=consFor(day, s);
-  return { k:"drive", at:atTime(day,s.home).getTime(), dep:atTime(day,s.depart).getTime(), date:key, km, kwh:r2(km*cons/100), cons,
+  const {key, km, dep, back}=commuteOn(day, s);
+  return { k:"drive", at:back, dep, date:key, km, kwh:r2(kwhFor(km, day, s)), cons:consFor(day, s),
     src: s.overrides[key]!=null ? "override" : "schedule" };
 }
 // Add the drives and charging windows that have ended since s.histAt (on the first run: since the oldest stored
@@ -475,8 +476,8 @@ function recordHistory(s, now){
   }
   from=Math.max(from, t-HIST_DAYS*DAY);
   for (let day=startOfDay(new Date(from)); day.getTime()<=t; day=addDays(day,1)){
-    const back=atTime(day,s.home).getTime(), key=dateKey(day);
-    if (kmOn(day,s)<=0 || back<=from || back>t || hist.some(h=>h.k==="drive" && h.date===key && h.src!=="errand")) continue;
+    const {key, km, back}=commuteOn(day, s);
+    if (km<=0 || back<=from || back>t || hist.some(h=>h.k==="drive" && h.date===key && h.src!=="errand")) continue;
     hist.push(driveEntry(day, s));
   }
   // The plan re-clips a running window on every recompute, so `planned` holds it in pieces: join touching ones
@@ -524,7 +525,7 @@ function explainReading(history, log, at, cause){
 function addErrand(history, km, s, at){
   const day=new Date(at), cons=consFor(day, s), t=at-1;
   const rest=history.filter(e=>!(e.k==="drive" && e.src==="errand" && e.at<at && e.at>at-10*60e3));
-  return km>0 ? histSort([...rest, { k:"drive", at:t, dep:null, date:dateKey(day), km, kwh:r2(km*cons/100), cons, src:"errand" }], at) : rest;
+  return km>0 ? histSort([...rest, { k:"drive", at:t, dep:null, date:dateKey(day), km, kwh:r2(kwhFor(km, day, s)), cons, src:"errand" }], at) : rest;
 }
 // After a km correction for a day: its drive entry (if recorded) takes the new distance.
 function correctDrive(history, key, s){
@@ -551,8 +552,7 @@ const pct = (kwh,B) => Math.round(kwh/B*100);
 function recentDays(prices, s, now, k, days=7){
   const out=[], today=startOfDay(now);
   for (let i=1;i<=days;i++){
-    const day=addDays(today,-i), next=addDays(day,1).getTime(), km=kmOn(day,s);
-    const dep=atTime(day,s.depart).getTime(), back=atTime(day,s.home).getTime();
+    const day=addDays(today,-i), next=addDays(day,1).getTime(), {km, dep, back}=commuteOn(day, s);
     const ps=[];
     for (let t=day.getTime(); t<next; t+=H){
       if (km>0 && t<back && t+H>dep) continue;   // away, same rule as plan()
@@ -748,6 +748,6 @@ function committed(P, now, s, short, nextDrive, day, when){
 export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
-  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, cheapLimit, priceRating, kmOn,
+  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor,
   buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom
 };
