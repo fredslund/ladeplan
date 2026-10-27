@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, setErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -907,18 +907,87 @@ test("Saturday errand: asked with no drive since, recorded as a drive at the rea
   const s = hist("2026-10-17T10:00");   // Sat, no commute
   const r = readAt(s, "2026-10-17T15:00", 72);   // 8 points below 80%
   assert.deepStrictEqual([r.q, r.logged], ["low", null]);
-  let h = addErrand(r.history, 25, s, r.reading.at);
-  h = addErrand(h, 30, s, r.reading.at);   // changed: replaces
-  const d = h.filter(e => e.k === "drive");
+  // as on the page: the reading sets the level before the errand is told
+  const now = new Date("2026-10-17T15:00"), drive = e => e.k === "drive";
+  const sr = { ...s, history: r.history, soc: 72, socAt: now.getTime(), readSoc: 72, readAt: now.getTime() };
+  let x = addErrand(sr, 25, r.reading.at, now);
+  x = addErrand({ ...sr, ...x }, 30, r.reading.at, now);   // changed: replaces
+  const d = x.history.filter(drive);
   assert.deepStrictEqual(d.map(e => [e.km, e.src, e.dep, e.at, e.date]), [[30, "errand", null, ms("2026-10-17T15:00") - 1, "2026-10-17"]]);
-  assert.deepStrictEqual(h.map(e => e.k), ["drive", "reading"]);
-  assert.strictEqual(addErrand(h, 0, s, r.reading.at).filter(e => e.k === "drive").length, 0);
+  assert.deepStrictEqual(x.history.map(e => e.k), ["drive", "reading"]);
+  assert.deepStrictEqual(x.errands, [{ at: ms("2026-10-17T15:00") - 1, km: 30 }]);
+  // the reading already includes it, so the estimate doesn't subtract it again
+  assert.strictEqual(levelEst({ ...sr, ...x }, new Date("2026-10-17T16:00")).trips.length, 0);
+  const none = addErrand({ ...sr, ...x }, 0, r.reading.at, now);
+  assert.deepStrictEqual([none.history.filter(drive).length, none.errands.length], [0, 0]);
   // an errand on a commute day doesn't stop the commute being recorded, nor follow a km correction
-  const m = hist("2026-10-19T05:00"), e = addErrand([], 10, m, ms("2026-10-19T06:00"));
-  const rec = recordHistory({ ...m, history: e, histAt: ms("2026-10-19T06:00") }, new Date("2026-10-19T18:00")).history;
+  const m = hist("2026-10-19T05:00"), e = setErrand(m, ms("2026-10-19T06:00"), 10, new Date("2026-10-19T06:30"));
+  const rec = recordHistory({ ...m, ...e, histAt: ms("2026-10-19T06:30") }, new Date("2026-10-19T18:00")).history;
   assert.deepStrictEqual(rec.map(x => [x.src, x.km]), [["errand", 10], ["schedule", 78]]);
   m.overrides = { "2026-10-19": 90 };
   assert.deepStrictEqual(correctDrive(rec, "2026-10-19", m).map(x => x.km), [10, 90]);
+});
+
+test("extra drive: the estimate subtracts it, and a reading after it is predicted with it", () => {
+  const s = hist("2026-10-17T10:00");   // Sat, 80%
+  Object.assign(s, setErrand(s, ms("2026-10-17T12:00"), 40, new Date("2026-10-17T12:30")));
+  const e = socEstimate(s, new Date("2026-10-17T15:00"));
+  assert.deepStrictEqual(e.trips.map(t => [t.leg, t.km]), [["errand", 40]]);
+  assert.ok(Math.abs(e.usedKwh - 6.8) < 1e-9, e.usedKwh);
+  const r = readAt(s, "2026-10-17T15:00", 68);   // 46.4 − 6.8 kWh ≈ 68%: as predicted, no question
+  assert.strictEqual(r.q, null);
+  assert.deepStrictEqual([r.logged.leg, r.logged.date, r.logged.km], ["errand", null, 40]);
+  // with a commute too, km corrections go to the commute day; legs in the order they ended
+  const m = hist("2026-10-19T06:00");
+  Object.assign(m, setErrand(m, ms("2026-10-19T19:00"), 20, new Date("2026-10-19T19:30")));
+  const em = socEstimate(m, new Date("2026-10-19T20:00"));
+  assert.deepStrictEqual(em.trips.map(t => t.leg), ["day", "errand"]);
+  assert.strictEqual(readAt(m, "2026-10-19T20:00", 50).logged.date, "2026-10-19");
+});
+
+test("an extra drive logged after the level was estimated corrects that level; a later reading already has it", () => {
+  const s = hist("2026-10-17T08:00", s => { s.soc = 60; s.socAt = ms("2026-10-17T18:00"); });   // moved forward at 18:00
+  const at = ms("2026-10-17T17:00"), now = new Date("2026-10-17T18:30");
+  const x = setErrand(s, at, 40, now);
+  assert.ok(Math.abs(x.soc - (60 - 6.8 / 58 * 100)) < 1e-9, x.soc);
+  assert.ok(Math.abs(setErrand({ ...s, ...x }, at, 20, now).soc - (60 - 3.4 / 58 * 100)) < 1e-9);   // km edited
+  assert.ok(Math.abs(setErrand({ ...s, ...x }, at, 0, now).soc - 60) < 1e-9);                      // removed
+  assert.strictEqual(levelEst({ ...s, ...x }, now).trips.length, 0);   // not subtracted twice
+  assert.strictEqual(readingEst({ ...s, ...x }, now).km, 40);          // but the next reading is predicted with it
+  const read = { ...s, readAt: s.socAt, readSoc: 60 };                 // a reading at 18:00 already includes it
+  assert.strictEqual(setErrand(read, at, 40, now).soc, 60);
+  assert.strictEqual(setErrand(s, ms("2026-10-17T18:15"), 40, now).soc, 60);   // after the level: the estimate subtracts it
+});
+
+test("a planned extra drive keeps the reserve; only the hour it starts in is away", () => {
+  const at = ms("2026-10-17T14:00");
+  const { P, s } = run("2026-10-17T09:00", s => { s.soc = 20; s.errands = [{ at, km: 150 }]; });   // Sat
+  const ev = P.events.find(e => e.errand);
+  assert.deepStrictEqual([ev.t, ev.check, ev.km], [at, true, 150]);
+  assert.strictEqual(P.nextDrive, ev);
+  assert.ok(ev.lvlAfter >= s.battery * s.reserve / 100 - 0.05, ev.lvlAfter);
+  assert.deepStrictEqual(P.slots.filter(sl => sl.t >= at - 3600e3 && sl.t < at + 2 * 3600e3).map(sl => sl.home), [true, false, true]);
+  // charged before it, not moved past it
+  assert.ok(P.blocks.some(b => b.end <= at), P.blocks.map(b => new Date(b.start)).join());
+});
+
+test("a planned extra drive enters the history once it has happened; edit, remove, prune, validate", () => {
+  const s = hist("2026-10-17T08:00"), at = ms("2026-10-17T14:00"), drives = h => h.filter(e => e.k === "drive");
+  Object.assign(s, setErrand(s, at, 40, new Date("2026-10-17T09:00")));
+  assert.strictEqual(s.history.length, 0);   // not driven yet
+  const h1 = recordHistory({ ...s, histAt: ms("2026-10-17T09:00") }, new Date("2026-10-17T13:00"));
+  assert.strictEqual(drives(h1.history).length, 0);
+  const h2 = recordHistory({ ...s, ...h1 }, new Date("2026-10-17T15:00"));
+  assert.deepStrictEqual(drives(h2.history).map(e => [e.src, e.km, e.at]), [["errand", 40, at]]);
+  assert.deepStrictEqual(recordHistory({ ...s, ...h2 }, new Date("2026-10-17T16:00")).history, h2.history);
+  const ed = setErrand({ ...s, ...h2 }, at, 25, new Date("2026-10-17T15:30"));
+  assert.deepStrictEqual([ed.errands, drives(ed.history).map(e => e.km)], [[{ at, km: 25 }], [25]]);
+  const rm = setErrand({ ...s, ...ed }, at, 0, new Date("2026-10-17T15:30"));
+  assert.deepStrictEqual([rm.errands, drives(rm.history)], [[], []]);
+  // errands older than the level and the last reading are dropped on the next change
+  const later = { ...s, ...ed, socAt: ms("2026-10-18T10:00"), readAt: ms("2026-10-18T10:00") };
+  assert.deepStrictEqual(setErrand(later, ms("2026-10-18T12:00"), 5, new Date("2026-10-18T12:00")).errands, [{ at: ms("2026-10-18T12:00"), km: 5 }]);
+  assert.deepStrictEqual(stored({ errands: [{ at: 1, km: 5 }, { at: "x", km: 5 }, { at: 2, km: 0 }, null] }).errands, [{ at: 1, km: 5 }]);
 });
 
 test("impossible consumption is not usable, without an answer", () => {

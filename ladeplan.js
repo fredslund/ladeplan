@@ -20,6 +20,7 @@ const DEF = {
   socAt: null,                         // ms when soc was last set (by a reading, "Use" or moved forward by rollLevel())
   readAt: null, readSoc: null,         // the last reading of the car (slider moved), for the consumption log
   planned: [],                         // [start,end] ms of charging windows shown since then (assumed done)
+  errands: [],                         // { at, km }: drives outside the commute ("Extra drive"), see setErrand()
   socLog: [],                          // readings after drives, for tuning consumption later
   history: [], histAt: null,           // what happened (drives, charging, readings, level set), see recordHistory()
   commit: null                         // session choice: { kind: plan|manual|none, until, windows, limit, at }
@@ -73,6 +74,7 @@ function settingsFrom(raw){
   else s.readSoc=Math.min(100, Math.max(0, s.readSoc));
   const win=w=>Array.isArray(w) && num(w[0]) && num(w[1]) && w[0]<w[1];
   s.planned=Array.isArray(s.planned) ? s.planned.filter(w=>win(w) && (w.length===2 || (w.length===3 && w[2]===1))) : [];
+  s.errands=Array.isArray(s.errands) ? s.errands.filter(e=>e && num(e.at) && num(e.km) && e.km>0).slice(-50) : [];
   const c=s.commit;
   s.commit = c && ["plan","manual","none"].includes(c.kind) && num(c.until) && num(c.at) && Array.isArray(c.windows)
     && c.windows.every(w=>win(w) && w.length===2) && (c.kind==="none" || (num(c.limit) && c.limit>=50 && c.limit<=100))
@@ -225,6 +227,10 @@ function drivesFor(s, now, horizonEnd){
     if (dep>now.getTime()) ev.push({t:dep, back, km, need:kwhFor(km,day,s), key, check:true});
     else if (back>now.getTime()) ev.push({t:back, back, km:km/2, need:kwhFor(km,day,s)/2, key, check:false, returning:true});
   }
+  // Errands later today or on a later day: a drive at that moment that must also keep the reserve. Only the hour it
+  // starts in counts as away (back just after t), which also keeps charging from being moved across it.
+  for (const e of s.errands) if (e.at>now.getTime() && e.at<horizonEnd)
+    ev.push({t:e.at, back:e.at+60e3, km:e.km, need:kwhFor(e.km,new Date(e.at),s), key:dateKey(new Date(e.at)), check:true, errand:true});
   return ev;
 }
 
@@ -356,7 +362,8 @@ function plan(hours, s, now, fillBelow=null){
 const DAY = 864e5;
 // Drives between `from` and `to`, as legs: the whole trip ("day") if it left after `from` and is back by `to`;
 // half if `from` fell while the car was away ("back", same rule as drivesFor()) or the car is still away at `to`
-// ("out": the drive to work counts as done once the departure time has passed).
+// ("out": the drive to work counts as done once the departure time has passed). Errands (s.errands) are legs
+// of their own ("errand") at their time. Sorted by when each leg ended.
 function drivesDone(s, from, to){
   const out=[];
   for (let day=startOfDay(new Date(from)); day.getTime()<=to; day=addDays(day,1)){
@@ -366,7 +373,11 @@ function drivesDone(s, from, to){
     const part=leg==="day" ? 1 : 0.5;
     out.push({ key, back, leg, km:km*part, cons:consFor(day, s), kwh:kwhFor(km*part, day, s) });
   }
-  return out;
+  for (const e of s.errands) if (e.at>from && e.at<=to){
+    const day=new Date(e.at);
+    out.push({ key:dateKey(day), back:e.at, leg:"errand", km:e.km, cons:consFor(day, s), kwh:kwhFor(e.km, day, s) });
+  }
+  return out.sort((a,b)=>a.back-b.back);
 }
 // Charging windows the app has shown, kept so a later estimate can assume they were used. The part of each
 // stored window before `now` stays (back to socAt or the last reading, max 14 days); from `now` on, the current plan's windows before the
@@ -426,7 +437,9 @@ function logReading(log, est, actualPct, s, now){
     return [...log.slice(0,-1), {...last, at:t, actKwh:act(last.startKwh)}];
   if (!est) return log;
   const legs=est.trips.map(x=>x.leg), leg=legs.every(l=>l==="day") ? "day" : legs.length===1 ? legs[0] : "mixed";
-  const entry={ at:t, from:est.from, date:est.trips[est.trips.length-1].key, leg, km:r2(est.km), predKwh:r2(est.usedKwh),
+  // date: the commute day a km correction applies to (an errand has no commute km to correct)
+  const commute=est.trips.filter(x=>x.leg!=="errand"), date=commute.length ? commute[commute.length-1].key : null;
+  const entry={ at:t, from:est.from, date, leg, km:r2(est.km), predKwh:r2(est.usedKwh),
     chargedKwh:r2(est.chargedKwh), chosenKwh:r2(est.chosenKwh), startKwh:r2(est.startKwh), actKwh:act(est.startKwh) };
   return [...log, entry].slice(-LOG_MAX);
 }
@@ -454,7 +467,8 @@ function deviates(e, s){
 // weekly pattern doesn't rewrite past days). Entries, sorted by `at` (ms), kept HIST_DAYS:
 //   drive   { at: back, dep, date, km, kwh, cons, src: schedule|override }  the day's round trip, once it has ended
 //   charge  { at: start, end, kwh, chosen }  a charging window the app showed (assumed) or the user chose
-//   drive   { …, dep: null, src: errand }   an errand told with a reading (addErrand())
+//   drive   { …, dep: null, src: errand }   an errand (s.errands, setErrand()) at its time; one told with a
+//           reading (addErrand()) sits just before the reading
 //   reading { at, pct, estPct, diffKwh, chargedKwh, cause? }  a level set from the car, vs. the estimate then
 //           (diff = car − estimate), with the charging assumed since the previous reading
 //   level   { at, pct, how: use|roll }       the estimate taken as the level ("Use", or moved forward by rollLevel())
@@ -480,6 +494,7 @@ function recordHistory(s, now){
     if (km<=0 || back<=from || back>t || hist.some(h=>h.k==="drive" && h.date===key && h.src!=="errand")) continue;
     hist.push(driveEntry(day, s));
   }
+  for (const e of s.errands) if (e.at>from && e.at<=t && !hist.some(h=>h.src==="errand" && h.at===e.at)) hist.push(errandEntry(e, s));
   // The plan re-clips a running window on every recompute, so `planned` holds it in pieces: join touching ones
   const kw=s.chargerKw*s.effPct/100;
   for (const [a,b,c] of [...s.planned].sort((x,y)=>x[0]-y[0])){
@@ -519,13 +534,32 @@ function explainReading(history, log, at, cause){
   return { history:history.map(e=>e.k==="reading" && e.at===at ? {...e, cause} : e),
     socLog:log.map(e=>e.at===at ? {...e, cause:LOG_CAUSE[cause]} : e) };
 }
-// An errand on a day without a commute, told with a reading at `at`: a drive in the history only (the reading
-// already set the level, so the plan doesn't need it). Just before the reading, so it sorts first; replaces an
-// errand told within the 10 minutes before (the reading may have been nudged since). 0 km removes it.
-function addErrand(history, km, s, at){
-  const day=new Date(at), cons=consFor(day, s), t=at-1;
-  const rest=history.filter(e=>!(e.k==="drive" && e.src==="errand" && e.at<at && e.at>at-10*60e3));
-  return km>0 ? histSort([...rest, { k:"drive", at:t, dep:null, date:dateKey(day), km, kwh:r2(kwhFor(km, day, s)), cons, src:"errand" }], at) : rest;
+function errandEntry(e, s){
+  const day=new Date(e.at);
+  return { k:"drive", at:e.at, dep:null, date:dateKey(day), km:e.km, kwh:r2(kwhFor(e.km, day, s)), cons:consFor(day, s), src:"errand" };
+}
+// Set the km of the errand at `at` (a drive outside the commute; 0 km removes it). A past one goes into the history
+// now (recordHistory() adds a future one once it has happened). Errands older than the level and the last reading
+// (max 14 days) are dropped: the estimate no longer needs them. Returns { errands, history, soc }.
+// soc: the level, corrected when it was estimated ("Use", rollLevel()) after the errand without it; a reading
+// after the errand already includes it.
+function setErrand(s, at, km, now){
+  const t=now.getTime(), keep=Math.max(Math.min(s.socAt||t, s.readAt||t), t-14*DAY);
+  const old=s.errands.find(e=>e.at===at)?.km || 0;
+  const errands=[...s.errands.filter(e=>e.at!==at && e.at>keep), ...(km>0 ? [{ at, km }] : [])].sort((a,b)=>a.at-b.at);
+  const rest=s.history.filter(e=>!(e.k==="drive" && e.src==="errand" && e.at===at));
+  const missed=s.socAt>0 && at<=s.socAt && !(s.readAt>=at);
+  const soc=missed ? Math.min(100, Math.max(0, s.soc-kwhFor(km-old, new Date(at), s)/s.battery*100)) : s.soc;
+  return { errands, history: km>0 && at<=t ? histSort([...rest, errandEntry({ at, km }, s)], t) : rest, soc };
+}
+// An errand told with a reading at `at` (it explains a low reading with no drive logged): just before the reading,
+// so it sorts first and the level the reading set already includes it. Replaces an errand told within the 10
+// minutes before (the reading may have been nudged since). 0 km removes it. Returns { errands, history, soc }.
+function addErrand(s, km, at, now){
+  const old=s.errands.filter(e=>e.at<at && e.at>at-10*60e3).concat(s.history.filter(e=>e.k==="drive" && e.src==="errand" && e.at<at && e.at>at-10*60e3));
+  let r={ errands:s.errands, history:s.history, soc:s.soc };
+  for (const e of old) r=setErrand({ ...s, ...r }, e.at, 0, now);
+  return setErrand({ ...s, ...r }, at-1, km, now);
 }
 // After a km correction for a day: its drive entry (if recorded) takes the new distance.
 function correctDrive(history, key, s){
@@ -748,6 +782,6 @@ function committed(P, now, s, short, nextDrive, day, when){
 export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
-  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor,
+  SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, setErrand, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor,
   buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom
 };
