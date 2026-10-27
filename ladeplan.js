@@ -23,7 +23,7 @@ const DEF = {
   errands: [],                         // { at, km }: drives outside the commute ("Extra drive"), see setErrand()
   socLog: [],                          // readings after drives, for tuning consumption later
   history: [], histAt: null,           // what happened (drives, charging, readings, level set), see recordHistory()
-  commit: null                         // session choice: { kind: plan|manual|none, until, windows, limit, at }
+  commit: null                         // session choice: { kind: plan|manual|adhoc|none, until, windows, limit, at }
 };
 const STORE = "ladeplan.v1";
 const LOG_MAX = 60;
@@ -76,7 +76,7 @@ function settingsFrom(raw){
   s.planned=Array.isArray(s.planned) ? s.planned.filter(w=>win(w) && (w.length===2 || (w.length===3 && w[2]===1))) : [];
   s.errands=Array.isArray(s.errands) ? s.errands.filter(e=>e && num(e.at) && num(e.km) && e.km>0).slice(-50) : [];
   const c=s.commit;
-  s.commit = c && ["plan","manual","none"].includes(c.kind) && num(c.until) && num(c.at) && Array.isArray(c.windows)
+  s.commit = c && ["plan","manual","adhoc","none"].includes(c.kind) && num(c.until) && num(c.at) && Array.isArray(c.windows)
     && c.windows.every(w=>win(w) && w.length===2) && (c.kind==="none" || (num(c.limit) && c.limit>=50 && c.limit<=100))
     ? { kind:c.kind, until:c.until, windows:c.windows, limit:c.kind==="none" ? null : c.limit, at:c.at } : null;
   s.history=Array.isArray(s.history) ? s.history.filter(e=>e && HIST_KINDS.includes(e.k) && num(e.at)).slice(-2000) : [];
@@ -534,6 +534,9 @@ function explainReading(history, log, at, cause){
   return { history:history.map(e=>e.k==="reading" && e.at===at ? {...e, cause} : e),
     socLog:log.map(e=>e.at===at ? {...e, cause:LOG_CAUSE[cause]} : e) };
 }
+// How much of [t0, t1] (ms) happened before the level at socAt without being in it: the level was an estimate
+// ("Use", rollLevel()) set after the last reading. A reading includes everything before it, so only (readAt, socAt].
+function missedMs(s, t0, t1){ const r=s.readAt||0; return s.socAt>r ? Math.max(0, Math.min(t1, s.socAt)-Math.max(t0, r)) : 0; }
 function errandEntry(e, s){
   const day=new Date(e.at);
   return { k:"drive", at:e.at, dep:null, date:dateKey(day), km:e.km, kwh:r2(kwhFor(e.km, day, s)), cons:consFor(day, s), src:"errand" };
@@ -548,8 +551,7 @@ function setErrand(s, at, km, now){
   const old=s.errands.find(e=>e.at===at)?.km || 0;
   const errands=[...s.errands.filter(e=>e.at!==at && e.at>keep), ...(km>0 ? [{ at, km }] : [])].sort((a,b)=>a.at-b.at);
   const rest=s.history.filter(e=>!(e.k==="drive" && e.src==="errand" && e.at===at));
-  const missed=s.socAt>0 && at<=s.socAt && !(s.readAt>=at);
-  const soc=missed ? Math.min(100, Math.max(0, s.soc-kwhFor(km-old, new Date(at), s)/s.battery*100)) : s.soc;
+  const soc=missedMs(s, at-1, at)>0 ? Math.min(100, Math.max(0, s.soc-kwhFor(km-old, new Date(at), s)/s.battery*100)) : s.soc;
   return { errands, history: km>0 && at<=t ? histSort([...rest, errandEntry({ at, km }, s)], t) : rest, soc };
 }
 // An errand told with a reading at `at` (it explains a low reading with no drive logged): just before the reading,
@@ -639,9 +641,19 @@ function oneWindow(P, sess, s, now){
 // The car takes charge limits in 10% steps from 50%; round up so the limit never stops charging early.
 const limitFor = (kwh, B) => Math.min(100, Math.max(50, Math.ceil(kwh/B*10-1e-6)*10));
 
+// A window [a, e] (ms) from clock times: an end at or before the start is the next day. The start is the next one
+// to come (a start more than 12 h ago is tomorrow), or with `past` the nearest (charging that already started).
+function timerWindow(now, start, end, past=false){
+  const nowMs=now.getTime();
+  let a=atTime(now, start).getTime();
+  if (!past && a<nowMs-12*H) a=atTime(addDays(now,1), start).getTime();
+  if (past && a>nowMs+12*H) a=atTime(addDays(now,-1), start).getTime();
+  let e=atTime(new Date(a), end).getTime(); if (e<=a) e=atTime(addDays(new Date(a),1), end).getTime();
+  return [a, e];
+}
 // The session choice to store, holding until the car next leaves: the proposed windows ("plan"), one timer
-// window of the user's ("manual": { start, end, limit } as clock times; a start up to 12 h ago means charging
-// from now, an end at or before the start is the next day) or no charging ("none").
+// window of the user's ("manual": { start, end, limit } as clock times, see timerWindow(); a start in the past
+// means charging from now) or no charging ("none"). Ad hoc charging ("adhoc") comes from addCharge().
 // null if a manual window doesn't fall between now and the departure.
 function commitFrom(P, kind, now, manual){
   const nowMs=now.getTime(), leave=P.nextDrive ? P.nextDrive.t : null;
@@ -652,14 +664,42 @@ function commitFrom(P, kind, now, manual){
     limit=limitFor(Math.max(...before.map(b=>b.lvlEnd)), P.B);
   }
   else if (kind==="manual"){
-    let a=atTime(now, manual.start).getTime(); if (a<nowMs-12*H) a=atTime(addDays(now,1), manual.start).getTime();
-    let e=atTime(new Date(a), manual.end).getTime(); if (e<=a) e=atTime(addDays(new Date(a),1), manual.end).getTime();
+    let [a,e]=timerWindow(now, manual.start, manual.end);
     a=Math.max(a, nowMs); if (leave!=null) e=Math.min(e, leave);
     if (e<=a) return null;
     windows=[[a,e]]; limit=manual.limit;
   }
   const until = leave ?? Math.max(nowMs, ...windows.map(w=>w[1]), ...before.map(b=>b.end));
   return { kind, until, windows, limit, at:nowMs };
+}
+
+// Charging outside the plan ("Charging" on the Battery card): { start, end, limit } as clock times, a start earlier
+// than now meaning it has run since then (timerWindow() with past). The part up to now is a chosen window in
+// `planned`, so the estimate counts it (and the history, once it has ended; a level estimated after it is raised by
+// it, see missedMs()). The rest becomes a session choice ("adhoc") holding until the window ends, so the planner
+// can still add charging after it, or joins the current choice. Returns { commit, planned, history, soc }.
+function addCharge(s, now, w){
+  const t=now.getTime(), [a,e]=timerWindow(now, w.start, w.end, true), kw=s.chargerKw*s.effPct/100;
+  let { commit, planned, history, soc }=s;
+  if (a<t){
+    const b=Math.min(e,t);
+    // Charging can't run twice at once: windows already assumed or chosen give way where they overlap, and the
+    // level is raised only by time an estimated level didn't already assume
+    const cut=(x,y)=>[...(x<a ? [[x,Math.min(y,a)]] : []), ...(y>b ? [[Math.max(x,b),y]] : [])];
+    const before=planned.reduce((m,w)=>m+missedMs(s, Math.max(w[0],a), Math.min(w[1],b)), 0);
+    planned=[...planned.flatMap(([x,y,...c])=>cut(x,y).map(w=>[...w,...c])), [a, b, 1]].sort((x,y)=>x[0]-y[0]);
+    history=history.flatMap(h=>h.k!=="charge" ? [h] : cut(h.at,h.end).map(([x,y])=>({ ...h, at:x, end:y, kwh:r2((y-x)/H*kw) })));
+    if (e<=t) history=histSort([...history, { k:"charge", at:a, end:b, kwh:r2((b-a)/H*kw), chosen:true }], t);
+    soc=Math.min(100, soc+(missedMs(s, a, b)-before)/H*kw/s.battery*100);
+  }
+  if (e>t){
+    const win=[Math.max(a,t), e], c=commit && commit.until>t ? commit : null;
+    // Overlapping windows are joined, so no hour is counted twice
+    const join=ws=>ws.sort((x,y)=>x[0]-y[0]).reduce((o,w)=>{ const l=o[o.length-1]; if (l && w[0]<=l[1]) l[1]=Math.max(l[1],w[1]); else o.push([...w]); return o; }, []);
+    commit = c ? { ...c, kind:c.kind==="none" ? "adhoc" : c.kind, windows:join([...c.windows, win]), limit:Math.max(c.limit||0, w.limit), until:Math.max(c.until, e) }
+      : { kind:"adhoc", until:e, windows:[win], limit:w.limit, at:t };
+  }
+  return { commit, planned, history, soc };
 }
 
 // Decision card, pure so it can be tested. Two questions decide the level:
@@ -758,7 +798,7 @@ function decide(P, now, s, prices){
 
 // Card for a session the user chose (accepted plan, own timer or no charging); it holds until the car leaves.
 function committed(P, now, s, short, nextDrive, day, when){
-  const c=P.commit, lvl={ plan:"Accepted", manual:"Your timer", none:"Not charging" }[c.kind];
+  const c=P.commit, lvl={ plan:"Accepted", manual:"Your timer", adhoc:"Charging", none:"Not charging" }[c.kind];
   const base={ committed:true, lvl, rate:null, setup:null };
   if (short) return { ...base, cls:"bad", title:`Your choice leaves ${day(short.t)} short`,
     big:`${short.short.toFixed(1)} kWh short of your ${s.reserve}% reserve`,
@@ -783,5 +823,5 @@ export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
   SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, setErrand, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor,
-  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom
+  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom, timerWindow, addCharge, missedMs
 };

@@ -175,8 +175,9 @@ a.inl{color:var(--known)}
     <input type="range" id="soc" min="0" max="100" step="1">
     <output id="socOut">–</output>
     <div class="socup" id="socUpdate" aria-live="polite" hidden></div>
-    <div class="socup" id="xDrive" hidden></div>
-    <div class="soclinks"><button type="button" class="linkbtn" id="xOpen" aria-expanded="false" aria-controls="xDrive">Extra drive</button>
+    <div class="socup" id="xPanel" hidden></div>
+    <div class="soclinks"><button type="button" class="linkbtn" id="xOpen" aria-expanded="false" aria-controls="xPanel">Extra drive</button>
+      <button type="button" class="linkbtn" id="cOpen" aria-expanded="false" aria-controls="xPanel">Charging</button>
       <a href="#log" class="linkbtn" id="openLog">History</a></div>
   </section>
 
@@ -321,7 +322,7 @@ a.inl{color:var(--known)}
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   startOfDay, addDays, atTime, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, patternKm, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand, setErrand,
+  buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, patternKm, commitFrom, addCharge, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand, setErrand,
   recordHistory, addReading, addLevel, correctDrive, historyCsv
 } from "./ladeplan.js";
 
@@ -377,9 +378,9 @@ function setSoc(v, now, reading){
   if (reading){ S.readAt=S.socAt; S.readSoc=v; }
   document.getElementById("soc").value=Math.round(v); document.getElementById("socOut").textContent=Math.round(v)+"%";
 }
-// Store an errand change (setErrand(), addErrand()); the level may have been corrected for it
-function applyErrand({ errands, history, soc }){
-  S.errands=errands; S.history=history;
+// Store a change from setErrand(), addErrand() or addCharge(); the level may have been corrected for it
+function applyChange({ soc, ...rest }){
+  Object.assign(S, rest);
   if (soc!==S.soc){ S.soc=SOC_SET=soc; document.getElementById("soc").value=Math.round(soc); document.getElementById("socOut").textContent=Math.round(soc)+"%"; }
 }
 function setKm(key, v){
@@ -430,7 +431,7 @@ function renderSocUpdate(now){
     if (!r){ ASK=null; return renderSocUpdate(now); }
     const pts=Math.round(Math.abs(r.pct-r.estPct)), low=ASK.dir==="low";
     const opts=low ? [["drove","Drove more"], ...(ASK.charging?[["charging-short","Charging didn't run fully"]]:[]), ["ok","Just off"]]
-      : [["charged-elsewhere","Charged somewhere else"], ...(ASK.date?[["drove","Drove less"]]:[]), ["ok","Just off"]];
+      : [["charged-elsewhere","Charged extra"], ...(ASK.date?[["drove","Drove less"]]:[]), ["ok","Just off"]];
     const field = !ASK.km ? "" : ASK.date ? kmField(ASK.date)
       : `<label class="field"><span>Km driven (errand)</span><input type="number" min="0" step="1" id="socErrand" value="${S.history.find(e=>e.src==="errand" && e.at<ASK.at && e.at>ASK.at-10*60e3)?.km ?? ""}"></label>`;
     box.innerHTML=`<p><b>${pts} points ${low?"below":"above"}</b> the estimated ${Math.round(r.estPct)}%. What was different?</p>
@@ -447,7 +448,7 @@ function renderSocUpdate(now){
     const errand=document.getElementById("socErrand");
     if (errand) errand.onchange=()=>{
       if (errand.value.trim()==="" || !isFinite(Number(errand.value))) return;
-      applyErrand(addErrand(S, Math.max(0, Math.round(Number(errand.value))), ASK.at, new Date()));
+      applyChange(addErrand(S, Math.max(0, Math.round(Number(errand.value))), ASK.at, new Date()));
       answer("drove");
       if (!document.getElementById("logView").hidden) renderLog();
     };
@@ -468,7 +469,7 @@ function renderSocUpdate(now){
     km.onchange=()=>{
       if (km.value.trim()==="" || !isFinite(Number(km.value))) return;
       const v=Math.max(0, Math.round(Number(km.value)));
-      if (km.dataset.at) applyErrand(setErrand(S, Number(km.dataset.at), v, new Date()));
+      if (km.dataset.at) applyChange(setErrand(S, Number(km.dataset.at), v, new Date()));
       else setKm(km.dataset.day, v);
       if (ASK){ S.socLog=relogKm(S.socLog, S); Object.assign(S, explainReading(S.history, S.socLog, ASK.at, "drove")); }
       saveSettings(); renderTrips(new Date()); recompute();
@@ -477,33 +478,55 @@ function renderSocUpdate(now){
   }
 }
 
-// Extra drive (errand) form on the Battery card. XD: null (closed) or the form values { km, time }, kept across
-// re-renders. A time later today plans for the drive; earlier counts it as driven. Today's errands can be removed.
+// Extra drive and Charging forms on the Battery card (one open at a time). XD: null (closed), { kind:"drive", km,
+// time } or { kind:"charge", start, end, limit }, kept across re-renders. A drive later today is planned for; earlier
+// counts as driven. Charging that started earlier counts since then (addCharge()). Today's drives can be removed.
 let XD=null;
 function renderExtra(){
-  const box=document.getElementById("xDrive"), now=new Date(), today=dateKey(now);
-  document.getElementById("xOpen").setAttribute("aria-expanded", !!XD);
+  const box=document.getElementById("xPanel"), now=new Date(), today=dateKey(now), $=id=>document.getElementById(id);
+  $("xOpen").setAttribute("aria-expanded", XD?.kind==="drive"); $("cOpen").setAttribute("aria-expanded", XD?.kind==="charge");
   if (!XD){ box.hidden=true; box.innerHTML=""; return; }
-  const list=S.errands.filter(e=>dateKey(new Date(e.at))===today);
+  const buttons=`<p class="note err" id="xErr" hidden></p>
+    <div class="row"><button type="button" class="btn" id="xSave">Save</button><button type="button" class="linkbtn" id="xCancel">Cancel</button></div>`;
+  const opener=XD.kind==="drive" ? "xOpen" : "cOpen";
+  const close=()=>{ XD=null; renderExtra(); $(opener).focus(); };
+  const err=t=>{ $("xErr").hidden=false; $("xErr").textContent=t; };
   box.hidden=false;
-  box.innerHTML=`<p><b>Extra drive</b> today, outside your commute</p>
-    <div class="row"><label class="field"><span>Km</span><input type="number" min="1" step="1" id="xKm" value="${XD.km}"></label>
-      <label class="field"><span>When</span><input type="time" id="xTime" value="${XD.time}"></label></div>
-    <p class="note err" id="xErr" hidden></p>
-    <div class="row"><button type="button" class="btn" id="xSave">Save</button><button type="button" class="linkbtn" id="xCancel">Cancel</button></div>`
-    + list.map(e=>`<div class="row"><span>${hhmm(e.at)} · ${e.km} km${e.at>now.getTime()?" (planned)":""}</span><button type="button" class="linkbtn" data-at="${e.at}">Remove</button></div>`).join("");
-  document.getElementById("xKm").oninput=e=>{ XD.km=e.target.value; };
-  document.getElementById("xTime").oninput=e=>{ XD.time=e.target.value; };
-  document.getElementById("xCancel").onclick=()=>{ XD=null; renderExtra(); document.getElementById("xOpen").focus(); };
-  document.getElementById("xSave").onclick=()=>{
-    const km=Math.round(Number(XD.km)), err=document.getElementById("xErr");
-    if (!(km>0) || !XD.time){ err.hidden=false; err.textContent="Enter the km and a time."; return; }
-    applyErrand(setErrand(S, atTime(new Date(), XD.time).getTime(), km, new Date()));
-    XD=null; saveSettings(); renderExtra(); recompute(); document.getElementById("xOpen").focus();
-  };
-  for (const b of box.querySelectorAll("[data-at]")) b.onclick=()=>{
-    applyErrand(setErrand(S, Number(b.dataset.at), 0, new Date())); saveSettings(); renderExtra(); recompute();
-  };
+  if (XD.kind==="drive"){
+    const list=S.errands.filter(e=>dateKey(new Date(e.at))===today);
+    box.innerHTML=`<p><b>Extra drive</b> today, outside your commute</p>
+      <div class="row"><label class="field"><span>Km</span><input type="number" min="1" step="1" id="xKm" value="${XD.km}"></label>
+        <label class="field"><span>When</span><input type="time" id="xTime" value="${XD.time}"></label></div>${buttons}`
+      + list.map(e=>`<div class="row"><span>${hhmm(e.at)} · ${e.km} km${e.at>now.getTime()?" (planned)":""}</span><button type="button" class="linkbtn" data-at="${e.at}">Remove</button></div>`).join("");
+    $("xKm").oninput=e=>{ XD.km=e.target.value; };
+    $("xTime").oninput=e=>{ XD.time=e.target.value; };
+    $("xSave").onclick=()=>{
+      const km=Math.round(Number(XD.km));
+      if (!(km>0) || !XD.time) return err("Enter the km and a time.");
+      applyChange(setErrand(S, atTime(new Date(), XD.time).getTime(), km, new Date()));
+      saveSettings(); close(); recompute();
+    };
+    for (const b of box.querySelectorAll("[data-at]")) b.onclick=()=>{
+      applyChange(setErrand(S, Number(b.dataset.at), 0, new Date())); saveSettings(); renderExtra(); recompute();
+    };
+  }
+  else {
+    const lim=[50,60,70,80,90,100].map(v=>`<option value="${v}"${v===XD.limit?" selected":""}>${v}%</option>`).join("");
+    box.innerHTML=`<p><b>Charging</b> outside the plan</p>
+      <div class="grid3"><label class="field"><span>Start</span><input type="time" id="xStart" value="${XD.start}"></label>
+        <label class="field"><span>End</span><input type="time" id="xEnd" value="${XD.end}"></label>
+        <label class="field"><span>Limit</span><select id="xLimit">${lim}</select></label></div>
+      <p class="note">A start earlier today counts as charged since then. An end before the start is the next day.</p>${buttons}`;
+    $("xStart").oninput=e=>{ XD.start=e.target.value; };
+    $("xEnd").oninput=e=>{ XD.end=e.target.value; };
+    $("xLimit").onchange=e=>{ XD.limit=Number(e.target.value); };
+    $("xSave").onclick=()=>{
+      if (!XD.start || !XD.end) return err("Enter a start and an end time.");
+      applyChange(addCharge(S, new Date(), XD));
+      saveSettings(); close(); recompute();
+    };
+  }
+  $("xCancel").onclick=close;
 }
 
 // Accept or reject the proposed session. CHOOSE: which part is open (null | "reject" | "own");
@@ -761,15 +784,20 @@ function bindInputs(){
     ASK = dir ? { dir, at:reading.at, date:logged ? logged.date : null, charging:reading.chargedKwh>0.05, km:false } : null;
     KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
   });
+  // Each link opens its form, or closes it if it is the one open
   document.getElementById("xOpen").addEventListener("click",()=>{
-    XD = XD ? null : { km:"", time:hhmm(Date.now()) }; renderExtra(); if (XD) document.getElementById("xKm").focus();
+    XD = XD?.kind==="drive" ? null : { kind:"drive", km:"", time:hhmm(Date.now()) }; renderExtra(); if (XD) document.getElementById("xKm").focus();
+  });
+  document.getElementById("cOpen").addEventListener("click",()=>{
+    const t=Date.now(), lim=Math.min(100, Math.max(50, Math.round(S.maxSoc/10)*10));
+    XD = XD?.kind==="charge" ? null : { kind:"charge", start:hhmm(t), end:hhmm(Math.ceil((t+H)/H)*H), limit:lim }; renderExtra(); if (XD) document.getElementById("xStart").focus();
   });
   document.getElementById("reload").addEventListener("click",()=>{ DEMO=false; load(); });
   document.getElementById("demo").addEventListener("click",()=>{ DEMO=true; load(); });
 }
 
 // History view: days newest first, entries in order within a day
-const CAUSE={ drove:"Distance corrected", "charging-short":"Charging didn't run fully", "charged-elsewhere":"Charged somewhere else", ok:"Just off" };
+const CAUSE={ drove:"Distance corrected", "charging-short":"Charging didn't run fully", "charged-elsewhere":"Charged extra", ok:"Just off" };
 function renderLog(){
   const list=document.getElementById("logList"), now=new Date();
   if (!S.history.length){ list.innerHTML=`<p class="note">Nothing yet. Drives and charging appear here once they have happened.</p>`; return; }
@@ -810,7 +838,8 @@ function recompute(){
   // Remember the charging shown, so the next estimate after a drive can assume it was done
   if (!DEMO){
     const pl=notePlanned(S.planned, P, now, S);
-    if (JSON.stringify(pl)!==JSON.stringify(S.planned)){ S.planned=pl; saveSettings(); }
+    // The Battery card shows the stored windows ("Charging … so far"), so redraw it when they change
+    if (JSON.stringify(pl)!==JSON.stringify(S.planned)){ S.planned=pl; saveSettings(); renderSocUpdate(now); }
   }
   renderDecision(P, now); renderChart(P, now); renderTimeline(P, now);
   if (model) document.getElementById("modelInfo").textContent =

@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, setErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, setErrand, logReading, relogKm, deviates, commitFrom, timerWindow, addCharge } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -988,6 +988,62 @@ test("a planned extra drive enters the history once it has happened; edit, remov
   const later = { ...s, ...ed, socAt: ms("2026-10-18T10:00"), readAt: ms("2026-10-18T10:00") };
   assert.deepStrictEqual(setErrand(later, ms("2026-10-18T12:00"), 5, new Date("2026-10-18T12:00")).errands, [{ at: ms("2026-10-18T12:00"), km: 5 }]);
   assert.deepStrictEqual(stored({ errands: [{ at: 1, km: 5 }, { at: "x", km: 5 }, { at: 2, km: 0 }, null] }).errands, [{ at: 1, km: 5 }]);
+});
+
+test("timer windows: next start for a timer, nearest start for charging that already began", () => {
+  const now = new Date("2026-10-27T18:00");
+  assert.deepStrictEqual(timerWindow(now, "02:00", "05:00"), [ms("2026-10-28T02:00"), ms("2026-10-28T05:00")]);
+  assert.deepStrictEqual(timerWindow(now, "12:00", "14:00", true), [ms("2026-10-27T12:00"), ms("2026-10-27T14:00")]);
+  assert.deepStrictEqual(timerWindow(now, "17:00", "01:00", true), [ms("2026-10-27T17:00"), ms("2026-10-28T01:00")]);
+  assert.deepStrictEqual(timerWindow(new Date("2026-10-28T01:00"), "23:00", "03:00", true), [ms("2026-10-27T23:00"), ms("2026-10-28T03:00")]);
+});
+
+test("ad hoc charging that has ended: a chosen window the estimate counts, in the history", () => {
+  const kw = 11 * 0.9, s = hist("2026-10-27T08:00", s => { s.soc = 40; s.readSoc = 40; });   // Tue, WFH via override
+  s.overrides = { "2026-10-27": 0 };
+  const now = new Date("2026-10-27T18:00"), x = addCharge(s, now, { start: "12:00", end: "14:00", limit: 80 });
+  assert.deepStrictEqual(x.planned, [[ms("2026-10-27T12:00"), ms("2026-10-27T14:00"), 1]]);
+  assert.strictEqual(x.commit, null);
+  assert.deepStrictEqual(x.history.map(e => [e.k, e.chosen, e.kwh]), [["charge", true, 2 * kw]]);
+  assert.strictEqual(x.soc, 40);   // the level is from 08:00, so the estimate adds it
+  const e = levelEst({ ...s, ...x }, now);
+  assert.ok(Math.abs(e.chosenKwh - 2 * kw) < 1e-9 && Math.abs(e.kwh - (0.4 * 58 + 2 * kw)) < 1e-9, e.kwh);
+  assert.deepStrictEqual(recordHistory({ ...s, ...x, histAt: now.getTime() }, new Date("2026-10-27T19:00")).history, x.history);
+  // a level estimated after it (moved forward at 16:00) is raised instead; a reading after it already has it
+  const rolled = { ...s, socAt: ms("2026-10-27T16:00") };
+  assert.ok(Math.abs(addCharge(rolled, now, { start: "12:00", end: "14:00", limit: 80 }).soc - (40 + 2 * kw / 58 * 100)) < 1e-9);
+  assert.strictEqual(addCharge({ ...rolled, readAt: rolled.socAt }, now, { start: "12:00", end: "14:00", limit: 80 }).soc, 40);
+});
+
+test("ad hoc charging replaces assumed charging in the same hours, and isn't counted twice", () => {
+  const kw = 11 * 0.9, s = hist("2026-10-27T08:00", s => { s.soc = 40; s.readSoc = 40; });
+  s.overrides = { "2026-10-27": 0 };
+  s.planned = [[ms("2026-10-27T13:00"), ms("2026-10-27T15:00")]];   // the plan assumed 13–15
+  s.history = [{ k: "charge", at: ms("2026-10-27T13:00"), end: ms("2026-10-27T15:00"), kwh: 2 * kw, chosen: false }];
+  const now = new Date("2026-10-27T18:00"), x = addCharge(s, now, { start: "12:00", end: "14:00", limit: 80 });
+  assert.deepStrictEqual(x.planned, [[ms("2026-10-27T12:00"), ms("2026-10-27T14:00"), 1], [ms("2026-10-27T14:00"), ms("2026-10-27T15:00")]]);
+  assert.deepStrictEqual(x.history.map(e => [new Date(e.at).getHours(), new Date(e.end).getHours(), e.chosen]), [[12, 14, true], [14, 15, false]]);
+  assert.ok(Math.abs(levelEst({ ...s, ...x }, now).chargedKwh - 3 * kw) < 1e-9);
+  // level moved forward at 16:00 (it assumed 13–15): raised only by 12–13
+  const rolled = { ...s, socAt: ms("2026-10-27T16:00") };
+  assert.ok(Math.abs(addCharge(rolled, now, { start: "12:00", end: "14:00", limit: 80 }).soc - (40 + kw / 58 * 100)) < 1e-9);
+});
+
+test("ad hoc charging still running: the rest is a session choice until it ends, then the plan takes over", () => {
+  const { s, hours, now } = run(NIGHT, s => { s.soc = 20; s.socAt = ms("2026-10-19T20:00"); s.readAt = s.socAt; s.readSoc = 20; });
+  const x = addCharge(s, now, { start: "20:30", end: "22:00", limit: 80 });   // now 21:00
+  assert.deepStrictEqual(x.planned, [[ms("2026-10-19T20:30"), now.getTime(), 1]]);
+  assert.deepStrictEqual([x.commit.kind, x.commit.until, x.commit.windows], ["adhoc", ms("2026-10-19T22:00"), [[now.getTime(), ms("2026-10-19T22:00")]]]);
+  const P = plan(hours, { ...s, ...x }, now), card = decide(P, now, { ...s, ...x }, null);
+  assert.ok(P.blocks[0].start === now.getTime() && Math.abs(P.blocks[0].end - ms("2026-10-19T22:00")) < 1000, P.blocks.map(b => new Date(b.start)).join());
+  assert.strictEqual(card.lvl, "Charging");
+  assert.ok(P.events.filter(e => e.check).every(e => e.lvlAfter >= 58 * 0.1 - 0.05));   // the plan still covers the drive
+  // with a choice already made, the window joins it
+  const acc = commitFrom(plan(hours, s, now), "plan", now);
+  const j = addCharge({ ...s, commit: acc }, now, { start: "21:00", end: "22:00", limit: 90 });
+  assert.deepStrictEqual([j.commit.kind, j.commit.until, j.commit.limit], ["plan", acc.until, 90]);
+  assert.ok(j.commit.windows.some(w => w[0] === now.getTime()));
+  assert.strictEqual(stored({ commit: x.commit }).commit.kind, "adhoc");
 });
 
 test("impossible consumption is not usable, without an answer", () => {
