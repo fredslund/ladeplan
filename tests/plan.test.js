@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, logReading, relogKm, deviates, commitFrom } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -361,6 +361,17 @@ function dayHistory(now, s) {
   }
   return prices;
 }
+
+test("commute helpers: pattern km, overrides, times and energy", () => {
+  const s = clone(DEF), mon = new Date("2026-10-19T12:00"), sat = new Date("2026-10-24T12:00");
+  assert.strictEqual(patternKm(mon, s), 78);
+  assert.strictEqual(patternKm(sat, s), 0);
+  s.overrides["2026-10-19"] = 100;
+  assert.deepStrictEqual(commuteOn(mon, s), { key: "2026-10-19", km: 100,
+    dep: new Date("2026-10-19T07:30").getTime(), back: new Date("2026-10-19T17:00").getTime() });
+  assert.strictEqual(patternKm(mon, s), 78);    // the pattern ignores overrides
+  assert.strictEqual(kwhFor(100, mon, s), 17);  // October is shoulder season: 17 kWh/100 km
+});
 
 test("recent days use home hours only, including midday on WFH days and weekends", () => {
   const now = new Date("2026-10-19T21:00"), s = clone(DEF);   // Mon; Fri 16, Sat 17, Sun 18 are home days
