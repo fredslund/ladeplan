@@ -143,7 +143,8 @@ a.inl{color:var(--known)}
 .err{color:var(--warn)}
 .note{font-size:12.5px;color:var(--muted)}
 .row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.soc .histlink{grid-column:1/-1;justify-self:end;margin:-6px -4px -8px 0;font-size:13px;text-decoration:none}
+.soclinks{grid-column:1/-1;justify-self:end;display:flex;gap:6px;margin:-6px -4px -8px 0}
+.soclinks .linkbtn{font-size:13px;text-decoration:none}
 .lday{display:flex;flex-direction:column}
 .lday .sh{font-size:15px;margin:0 0 4px}
 .lrow{display:grid;grid-template-columns:7.4em 1fr auto;gap:10px;padding:7px 0;border-top:1px solid var(--line);align-items:baseline;font-variant-numeric:tabular-nums}
@@ -174,7 +175,9 @@ a.inl{color:var(--known)}
     <input type="range" id="soc" min="0" max="100" step="1">
     <output id="socOut">–</output>
     <div class="socup" id="socUpdate" aria-live="polite" hidden></div>
-    <a href="#log" class="linkbtn histlink" id="openLog">History</a>
+    <div class="socup" id="xDrive" hidden></div>
+    <div class="soclinks"><button type="button" class="linkbtn" id="xOpen" aria-expanded="false" aria-controls="xDrive">Extra drive</button>
+      <a href="#log" class="linkbtn" id="openLog">History</a></div>
   </section>
 
   <section class="card decision" id="decision">
@@ -317,8 +320,8 @@ a.inl{color:var(--known)}
 <script type="module">
 import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
-  startOfDay, addDays, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
-  buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, patternKm, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand,
+  startOfDay, addDays, atTime, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
+  buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, patternKm, commitFrom, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand, setErrand,
   recordHistory, addReading, addLevel, correctDrive, historyCsv
 } from "./ladeplan.js";
 
@@ -374,6 +377,11 @@ function setSoc(v, now, reading){
   if (reading){ S.readAt=S.socAt; S.readSoc=v; }
   document.getElementById("soc").value=Math.round(v); document.getElementById("socOut").textContent=Math.round(v)+"%";
 }
+// Store an errand change (setErrand(), addErrand()); the level may have been corrected for it
+function applyErrand({ errands, history, soc }){
+  S.errands=errands; S.history=history;
+  if (soc!==S.soc){ S.soc=SOC_SET=soc; document.getElementById("soc").value=Math.round(soc); document.getElementById("socOut").textContent=Math.round(soc)+"%"; }
+}
 function setKm(key, v){
   const pat=patternKm(new Date(key+"T12:00"), S);
   if (v===pat) delete S.overrides[key]; else S.overrides[key]=v;
@@ -388,6 +396,8 @@ function renderSocUpdate(now){
   // The field always edits the whole day's km; say so when only one drive of it is counted
   const kmField=(key, half)=>{ const d=new Date(key+"T12:00");
     return `<label class="field"><span>Km driven ${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}${half?" (round trip)":""}</span><input type="number" min="0" step="1" id="socKmIn" data-day="${key}" value="${kmOn(d,S)}"></label>`; };
+  // An extra drive (errand) has its own km; 0 removes it
+  const errandField=at=>`<label class="field"><span>Km, extra drive ${set(at)}</span><input type="number" min="0" step="1" id="socKmIn" data-at="${at}" value="${S.errands.find(e=>e.at===at)?.km ?? ""}"></label>`;
   // How old the last reading is; the level is estimated since then
   const read=S.readAt ? new Date(S.readAt) : null, ageDays=read ? (now-read)/864e5 : 0;
   const age=!S.socAt ? "" : !read ? "No reading of the car yet." : ageDays<1 ? ""
@@ -403,13 +413,13 @@ function renderSocUpdate(now){
     ASK=null; KM_OPEN=false; S.history=addLevel(S.history, v, "use", t); setSoc(v, t); saveSettings(); recompute();
   }; };
   if (est){
-    const lastTrip=est.trips[est.trips.length-1], half=lastTrip.leg!=="day";
+    const lastTrip=est.trips[est.trips.length-1], half=lastTrip.leg==="out" || lastTrip.leg==="back";
     const days=est.trips.length>1 ? ` (${est.trips.length} drives, ${est.trips.map(t=>DOW[new Date(t.back).getDay()]).join(", ")})`
-      : lastTrip.leg==="out" ? " drive to work" : lastTrip.leg==="back" ? " drive home" : "";
+      : lastTrip.leg==="out" ? " drive to work" : lastTrip.leg==="back" ? " drive home" : lastTrip.leg==="errand" ? " extra drive" : "";
     box.innerHTML=`<p><b>${lastTrip.leg==="out"?"At work?":"Back home?"}</b> Estimated <span class="num">${est.pct}%</span></p>
       <p class="note">${from(est)}${charged(est)} − ${Math.round(est.km)} km${days} × ${est.cons.toFixed(1)} kWh/100 km (${est.usedKwh.toFixed(1)} kWh). The plan uses this; or set the slider to what the car shows.</p>
       ${useBtn(est, `<button type="button" class="linkbtn" id="socKm" aria-expanded="${KM_OPEN}">Edit km</button>`)}
-      <div ${KM_OPEN?"":"hidden"}>${kmField(lastTrip.key, half)}</div>${ageNote}`;
+      <div ${KM_OPEN?"":"hidden"}>${lastTrip.leg==="errand" ? errandField(lastTrip.back) : kmField(lastTrip.key, half)}</div>${ageNote}`;
     bindUse(est);
     document.getElementById("socKm").onclick=()=>{ KM_OPEN=!KM_OPEN; renderSocUpdate(new Date()); if (KM_OPEN) document.getElementById("socKmIn").focus(); };
   }
@@ -437,7 +447,7 @@ function renderSocUpdate(now){
     const errand=document.getElementById("socErrand");
     if (errand) errand.onchange=()=>{
       if (errand.value.trim()==="" || !isFinite(Number(errand.value))) return;
-      S.history=addErrand(S.history, Math.max(0, Math.round(Number(errand.value))), S, ASK.at);
+      applyErrand(addErrand(S, Math.max(0, Math.round(Number(errand.value))), ASK.at, new Date()));
       answer("drove");
       if (!document.getElementById("logView").hidden) renderLog();
     };
@@ -457,12 +467,43 @@ function renderSocUpdate(now){
   if (km){
     km.onchange=()=>{
       if (km.value.trim()==="" || !isFinite(Number(km.value))) return;
-      setKm(km.dataset.day, Math.max(0, Math.round(Number(km.value))));
+      const v=Math.max(0, Math.round(Number(km.value)));
+      if (km.dataset.at) applyErrand(setErrand(S, Number(km.dataset.at), v, new Date()));
+      else setKm(km.dataset.day, v);
       if (ASK){ S.socLog=relogKm(S.socLog, S); Object.assign(S, explainReading(S.history, S.socLog, ASK.at, "drove")); }
       saveSettings(); renderTrips(new Date()); recompute();
     };
     if (refocus) km.focus();
   }
+}
+
+// Extra drive (errand) form on the Battery card. XD: null (closed) or the form values { km, time }, kept across
+// re-renders. A time later today plans for the drive; earlier counts it as driven. Today's errands can be removed.
+let XD=null;
+function renderExtra(){
+  const box=document.getElementById("xDrive"), now=new Date(), today=dateKey(now);
+  document.getElementById("xOpen").setAttribute("aria-expanded", !!XD);
+  if (!XD){ box.hidden=true; box.innerHTML=""; return; }
+  const list=S.errands.filter(e=>dateKey(new Date(e.at))===today);
+  box.hidden=false;
+  box.innerHTML=`<p><b>Extra drive</b> today, outside your commute</p>
+    <div class="row"><label class="field"><span>Km</span><input type="number" min="1" step="1" id="xKm" value="${XD.km}"></label>
+      <label class="field"><span>When</span><input type="time" id="xTime" value="${XD.time}"></label></div>
+    <p class="note err" id="xErr" hidden></p>
+    <div class="row"><button type="button" class="btn" id="xSave">Save</button><button type="button" class="linkbtn" id="xCancel">Cancel</button></div>`
+    + list.map(e=>`<div class="row"><span>${hhmm(e.at)} · ${e.km} km${e.at>now.getTime()?" (planned)":""}</span><button type="button" class="linkbtn" data-at="${e.at}">Remove</button></div>`).join("");
+  document.getElementById("xKm").oninput=e=>{ XD.km=e.target.value; };
+  document.getElementById("xTime").oninput=e=>{ XD.time=e.target.value; };
+  document.getElementById("xCancel").onclick=()=>{ XD=null; renderExtra(); document.getElementById("xOpen").focus(); };
+  document.getElementById("xSave").onclick=()=>{
+    const km=Math.round(Number(XD.km)), err=document.getElementById("xErr");
+    if (!(km>0) || !XD.time){ err.hidden=false; err.textContent="Enter the km and a time."; return; }
+    applyErrand(setErrand(S, atTime(new Date(), XD.time).getTime(), km, new Date()));
+    XD=null; saveSettings(); renderExtra(); recompute(); document.getElementById("xOpen").focus();
+  };
+  for (const b of box.querySelectorAll("[data-at]")) b.onclick=()=>{
+    applyErrand(setErrand(S, Number(b.dataset.at), 0, new Date())); saveSettings(); renderExtra(); recompute();
+  };
 }
 
 // Accept or reject the proposed session. CHOOSE: which part is open (null | "reject" | "own");
@@ -608,7 +649,7 @@ function renderChart(P, now){
 function renderTimeline(P, now){
   const items=[];
   P.blocks.forEach(b=>items.push({t:b.start, html:`<div class="trow chg"><div class="when">${shortDay(b.start,now)} ${hm5(b.start)}</div><div class="what">Charge until ${hm5(b.end,true)} · to ${Math.min(100,Math.ceil(b.lvlEnd/P.B*100-1e-6))}%${b.fc?'<span class="pill fc">forecast</span>':''}</div><div class="val">${b.kwh.toFixed(1)} kWh · ${Math.round(b.cost)} kr</div></div>`}));
-  P.events.forEach(e=>items.push({t:e.t, html:`<div class="trow"><div class="when">${shortDay(e.t,now)} ${hhmm(e.t)}</div><div class="what">${e.returning?"Driving home":"Leave"} · ${Math.round(e.km)} km · ${e.need.toFixed(1)} kWh</div><div class="val">${pct(e.lvlBefore,P.B)}% → ${pct(e.lvlAfter,P.B)}%</div></div>`}));
+  P.events.forEach(e=>items.push({t:e.t, html:`<div class="trow"><div class="when">${shortDay(e.t,now)} ${hhmm(e.t)}</div><div class="what">${e.returning?"Driving home":e.errand?"Extra drive":"Leave"} · ${Math.round(e.km)} km · ${e.need.toFixed(1)} kWh</div><div class="val">${pct(e.lvlBefore,P.B)}% → ${pct(e.lvlAfter,P.B)}%</div></div>`}));
   items.sort((a,b)=>a.t-b.t);
   const tot=P.blocks.reduce((a,b)=>a+b.cost,0), kwh=P.blocks.reduce((a,b)=>a+b.kwh,0);
   document.getElementById("timeline").innerHTML = items.length
@@ -720,6 +761,9 @@ function bindInputs(){
     ASK = dir ? { dir, at:reading.at, date:logged ? logged.date : null, charging:reading.chargedKwh>0.05, km:false } : null;
     KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
   });
+  document.getElementById("xOpen").addEventListener("click",()=>{
+    XD = XD ? null : { km:"", time:hhmm(Date.now()) }; renderExtra(); if (XD) document.getElementById("xKm").focus();
+  });
   document.getElementById("reload").addEventListener("click",()=>{ DEMO=false; load(); });
   document.getElementById("demo").addEventListener("click",()=>{ DEMO=true; load(); });
 }
@@ -737,7 +781,7 @@ function renderLog(){
     const d=new Date(k+"T12:00"), diff=Math.round((startOfDay(now)-startOfDay(d))/864e5);
     const title=diff===0 ? "Today" : diff===1 ? "Yesterday" : `${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}`;
     return `<section class="card lday"><h2 class="sh">${title}</h2>${es.map(e=>
-      e.k==="drive" ? row(e.dep ? `${hhmm(e.dep)}–${hhmm(e.at)}` : hhmm(e.at+1), `Drove ${e.km} km`, `${e.src==="errand"?"Errand · ":""}${e.cons} kWh/100 km${e.src==="override"?" · km corrected":""}`, kwh(-e.kwh))
+      e.k==="drive" ? row(e.dep ? `${hhmm(e.dep)}–${hhmm(e.at)}` : hhmm(e.at+1), `Drove ${e.km} km`, `${e.src==="errand"?"Extra drive · ":""}${e.cons} kWh/100 km${e.src==="override"?" · km corrected":""}`, kwh(-e.kwh))
       : e.k==="charge" ? row(`${hhmm(e.at)}–${hhmm(e.end)}`, "Charged", e.chosen ? "Chosen" : "Assumed from the plan", kwh(e.kwh, true), "plus")
       : e.k==="reading" ? row(hhmm(e.at), `Reading ${Math.round(e.pct)}%`, (e.estPct!=null ? `Estimated ${Math.round(e.estPct)}%` : "No estimate") + (CAUSE[e.cause] ? ` · ${CAUSE[e.cause]}` : ""), e.diffKwh!=null ? kwh(e.diffKwh, true) : "")
       : row(hhmm(e.at), `${e.how==="use"?"Estimate used":"Moved forward"} · ${Math.round(e.pct)}%`, "Estimate, not a reading")
