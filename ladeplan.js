@@ -23,6 +23,9 @@ const DEF = {
   errands: [],                         // { at, km }: drives outside the commute ("Extra drive"), see setErrand()
   socLog: [],                          // readings after drives, for tuning consumption later
   history: [], histAt: null,           // what happened (drives, charging, readings, level set), see recordHistory()
+  charges: [],                         // logged charging sessions { at, from, to, kwh, estStart, preheat }, see capEstimate()
+  useEstCap: null,                     // use the estimated capacity: null = once 3+ sessions with a read start, or true/false
+  chargeSkip: null,                    // end (ms) of the charge whose "Log this charge?" was skipped, see chargePrompt()
   commit: null                         // session choice: { kind: plan|manual|adhoc|none, until, windows, limit, at }
 };
 const STORE = "ladeplan.v1";
@@ -30,6 +33,7 @@ const LOG_MAX = 60;
 const HIST_DAYS = 120;
 const HIST_KINDS = ["drive","charge","reading","level"];
 const CAR_MAX = 24;
+const CHARGES_MAX = 50;
 // Allowed range per numeric setting; out-of-range values are clamped, non-numbers fall back to the default.
 const LIMITS = {
   soc:[0,100], kmOneWay:[0,500], battery:[10,200], reserve:[0,50], maxSoc:[50,100], chargerKw:[1,22], effPct:[50,100], cheapFill:[0,5], oneWindowKr:[0,50],
@@ -82,6 +86,11 @@ function settingsFrom(raw){
   s.history=Array.isArray(s.history) ? s.history.filter(e=>e && HIST_KINDS.includes(e.k) && num(e.at)).slice(-2000) : [];
   if (!num(s.histAt)) s.histAt=null;
   s.socLog=Array.isArray(s.socLog) ? s.socLog.filter(e=>e && num(e.at) && num(e.from) && num(e.km) && num(e.predKwh) && num(e.startKwh)).slice(-LOG_MAX) : [];
+  const pctOk=v=>num(v) && v>=0 && v<=100;
+  s.charges=Array.isArray(s.charges) ? s.charges.filter(e=>e && num(e.at) && pctOk(e.from) && pctOk(e.to) && num(e.kwh) && e.kwh>0 && e.kwh<=200)
+    .map(e=>({ at:e.at, from:e.from, to:e.to, kwh:e.kwh, estStart:e.estStart===true, preheat:e.preheat===true })).sort((a,b)=>a.at-b.at).slice(-CHARGES_MAX) : [];
+  if (typeof s.useEstCap!=="boolean") s.useEstCap=null;
+  if (!num(s.chargeSkip)) s.chargeSkip=null;
   return s;
 }
 
@@ -108,6 +117,80 @@ function dayLabel(t, now){
 /* ---------- consumption ---------- */
 const SEASON = { s:"Summer", h:"Shoulder", w:"Winter" };
 const consFor = (day, s) => s.cons[s.seasons[new Date(day).getMonth()]];
+
+/* ---------- battery capacity from logged charging ---------- */
+// The wallbox's kWh over the points the battery gained gives grid kWh per point, k = capacity / (100 × efficiency).
+// Capacity and efficiency can't be told apart from it, so the efficiency setting stays and capacity = 100 × k × eff.
+// That makes charging exact (grid kWh = points × k) whatever the split; trips use the capacity, so if a drop is
+// really efficiency (winter), trips are predicted slightly high, which errs on the safe side.
+// Valid sessions: 20+ points, not pre-heated while plugged in. The last CAP_N of them within CAP_DAYS of the
+// newest; with 4+, any more than 10% from the median k is left out. A start % that was an estimate counts half
+// and isn't counted towards the 3 needed to use the estimate by default.
+const CAP_MIN = 20, CAP_N = 10, CAP_DAYS = 60, CAP_OUT = 0.10, CAP_AUTO = 3;
+function capEstimate(s){
+  const eff=s.effPct/100, charges=s.charges || [];
+  const rows=charges.map(e=>{ const d=e.to-e.from, k=d>0 ? e.kwh/d : null;
+    return { ...e, d, k, B:k==null ? null : 100*k*eff, why:d<CAP_MIN ? "under 20 points" : e.preheat ? "pre-heated" : null }; });
+  const valid=rows.filter(r=>!r.why), newest=valid.length ? valid[valid.length-1].at : 0;
+  for (const [i,r] of valid.entries()) if (i<valid.length-CAP_N || r.at<newest-CAP_DAYS*DAY) r.why="older";
+  let used=valid.filter(r=>!r.why);
+  if (used.length>=4){
+    const ks=used.map(r=>r.k).sort((a,b)=>a-b), m=ks.length/2, med=ks.length%2 ? ks[Math.floor(m)] : (ks[m-1]+ks[m])/2;
+    for (const r of used) if (Math.abs(r.k/med-1)>CAP_OUT) r.why="outlier";
+    used=used.filter(r=>!r.why);
+  }
+  const nRead=used.filter(r=>!r.estStart).length;
+  const active=s.useEstCap===true ? used.length>0 : s.useEstCap===null && nRead>=CAP_AUTO;
+  if (!used.length) return { k:null, B:null, pm:null, n:0, nRead:0, active:false, rows };
+  // Ratio estimator: large charges weigh more, which suits ±1 point of display rounding per session
+  const w=r=>r.estStart ? 0.5 : 1, D=used.reduce((a,r)=>a+w(r)*r.d, 0);
+  const k=used.reduce((a,r)=>a+w(r)*r.kwh, 0)/D;
+  // Uncertainty: ±1 point per session (±3 with an estimated start), plus the spread between sessions (n ≥ 2)
+  const round=k*Math.sqrt(used.reduce((a,r)=>a+(w(r)*(r.estStart ? 3 : 1))**2, 0))/D;
+  const n=used.length, spread=n<2 ? 0 : Math.sqrt(used.reduce((a,r)=>a+(w(r)*(r.kwh-k*r.d))**2, 0)*n/(n-1))/D;
+  const sd=Math.sqrt(round*round+spread*spread);
+  return { k, B:100*k*eff, pm:100*sd*eff, n, nRead, active, rows };
+}
+// Usable battery (kWh) the app works with: the estimate when it's in use, else the setting
+function capacity(s){
+  if (!s.charges || !s.charges.length) return s.battery;
+  const e=capEstimate(s);
+  return e.active ? e.B : s.battery;
+}
+// Add a logged charging session (at: when it ended), or replace the one at the same time; at most CHARGES_MAX
+function logCharge(charges, e){
+  return [...charges.filter(c=>c.at!==e.at), e].sort((a,b)=>a.at-b.at).slice(-CHARGES_MAX);
+}
+// Form values for logging the last charging in the history: { at, from, to, estStart, startAt, endAt } (from may be
+// null). The session is the last run of charge entries, with any level set during a window inside it. Start % is the
+// level set just before it (an estimate unless it was a reading), end % the first reading after it ended (before any
+// drive), else the charge limit; startAt/endAt are those entries' times, or null. With no charging: the level now.
+function chargeDraft(s, now){
+  const h=s.history, li=h.findLastIndex(e=>e.k==="charge"), lim=s.commit && s.commit.limit!=null ? s.commit.limit : s.maxSoc;
+  if (li<0) return { at:now.getTime(), from:Math.round(s.soc), to:lim, estStart:s.readAt!==s.socAt, startAt:null, endAt:null };
+  const inside=(e,j)=>h.some((c,x)=>x<j && c.k==="charge" && c.end>e.at);
+  let j=li-1; while (j>=0 && (h[j].k==="charge" || (h[j].k!=="drive" && inside(h[j],j)))) j--;
+  const set=j>=0 && (h[j].k==="reading" || h[j].k==="level") ? h[j] : null;
+  const next=h.slice(li+1).find(e=>e.k!=="level" && !(e.k==="reading" && e.at<h[li].end)), after=next && next.k==="reading" ? next : null;
+  return { at:h[li].end, from:set ? Math.round(set.pct) : null, to:after ? Math.round(after.pct) : lim, estStart:!set || set.k!=="reading",
+    startAt:set ? set.at : null, endAt:after ? after.at : null };
+}
+// The charge to ask the wallbox's kWh for, right after the reading that ended it (that reading is still the level):
+// its start must be a reading too (slider or "Car shows"), not an estimate, it gained CAP_MIN+ points, the reading
+// wasn't explained as charged elsewhere, and it isn't logged or skipped (s.chargeSkip). Else null.
+function chargePrompt(s, now){
+  if (!s.history.some(e=>e.k==="charge")) return null;
+  const d=chargeDraft(s, now), end=s.history.find(e=>e.k==="reading" && e.at===d.endAt);
+  return end && d.endAt===s.readAt && s.socAt===s.readAt && !d.estStart && d.to-d.from>=CAP_MIN && end.cause!=="charged-elsewhere"
+    && !s.charges.some(c=>c.at===d.at) && s.chargeSkip!==d.at ? d : null;
+}
+// Whether the level now is a reading of the car with no drive or charging since, so charging from now on would
+// have a start read from the car
+function readStart(s, now){
+  if (s.readAt==null || s.socAt!==s.readAt) return false;
+  const e=levelEst(s, now);
+  return !e || (!e.trips.length && e.chargedKwh<0.05);
+}
 
 /* ---------- prices ---------- */
 const isTariffWinter = t => { const m=new Date(t).getMonth(); return m>=9 || m<=2; };   // Oct–Mar
@@ -236,7 +319,7 @@ function drivesFor(s, now, horizonEnd){
 
 // fillBelow (kr/kWh, from cheapLimit()): also top up to the charge limit in known-price hours below it.
 function plan(hours, s, now, fillBelow=null){
-  const nowMs=now.getTime(), B=s.battery, eff=s.effPct/100;
+  const nowMs=now.getTime(), B=capacity(s), eff=s.effPct/100;
   // Start from the level now: the level set, plus charging planned and drives made since (levelEst())
   const est=levelEst(s, now), res=B*s.reserve/100, soc0=est ? est.kwh : B*s.soc/100;
   const end = hours.length ? hours[hours.length-1].t+H : nowMs;
@@ -404,7 +487,7 @@ function levelEst(s, now){
   const to=now.getTime(), from=s.socAt;
   if (!(from>0) || from>to) return null;
   const trips=drivesDone(s, from, to);
-  const B=s.battery, kw=s.chargerKw*s.effPct/100;
+  const B=capacity(s), kw=s.chargerKw*s.effPct/100;
   const kwhIn=w=>Math.max(0, Math.min(w[1],to)-Math.max(w[0],from))/H*kw;
   const chargedKwh=s.planned.reduce((a,w)=>a+kwhIn(w), 0), chosenKwh=s.planned.reduce((a,w)=>a+(w[2] ? kwhIn(w) : 0), 0);
   const usedKwh=trips.reduce((a,t)=>a+t.kwh,0), km=trips.reduce((a,t)=>a+t.km,0);
@@ -425,14 +508,14 @@ function readingEst(s, now){
 function rollLevel(s, now){
   if (!(s.socAt>0) || now.getTime()-s.socAt<DAY) return null;
   const e=levelEst(s, now);
-  return e ? { soc:Math.round(e.kwh/s.battery*1e4)/100, socAt:now.getTime() } : null;
+  return e ? { soc:Math.round(e.kwh/capacity(s)*1e4)/100, socAt:now.getTime() } : null;
 }
 const r2 = v => Math.round(v*100)/100;
 // Log a reading after a drive (actualPct null = the estimate was accepted). A change within 10 minutes of the
 // last reading with no drive ended since is a nudge of the slider: it corrects that reading instead of adding one.
 function logReading(log, est, actualPct, s, now){
   const t=now.getTime(), last=log[log.length-1];
-  const act=start=>actualPct==null ? null : r2(start-s.battery*actualPct/100);
+  const act=start=>actualPct==null ? null : r2(start-capacity(s)*actualPct/100);
   if (last && t-last.at<10*60e3 && !drivesDone(s, last.at, t).length)
     return [...log.slice(0,-1), {...last, at:t, actKwh:act(last.startKwh)}];
   if (!est) return log;
@@ -459,7 +542,7 @@ function relogKm(log, s){
 // A reading far enough off the prediction to ask about the distance: 5+ points of battery and 25%+ off.
 // Not for a single drive to or from work: on half a trip, rounding and morning/evening differences dominate.
 function deviates(e, s){
-  return e.leg!=="out" && e.leg!=="back" && e.actKwh!=null && e.predKwh>0 && Math.abs(e.actKwh-e.predKwh)>=0.05*s.battery && Math.abs(e.actKwh/e.predKwh-1)>0.25;
+  return e.leg!=="out" && e.leg!=="back" && e.actKwh!=null && e.predKwh>0 && Math.abs(e.actKwh-e.predKwh)>=0.05*capacity(s) && Math.abs(e.actKwh/e.predKwh-1)>0.25;
 }
 
 /* ---------- history ---------- */
@@ -486,7 +569,7 @@ function recordHistory(s, now){
   if (!(from>0)){
     from=Math.max(t-14*DAY, Math.min(t, s.readAt||t, s.socAt||t, ...s.socLog.map(e=>e.from), ...s.planned.map(w=>w[0])));
     for (const e of s.socLog) if (e.actKwh!=null && e.at>=from)
-      hist.push({ k:"reading", at:e.at, pct:r2((e.startKwh-e.actKwh)/s.battery*100), estPct:r2((e.startKwh-e.predKwh)/s.battery*100), diffKwh:r2(e.predKwh-e.actKwh) });
+      hist.push({ k:"reading", at:e.at, pct:r2((e.startKwh-e.actKwh)/capacity(s)*100), estPct:r2((e.startKwh-e.predKwh)/capacity(s)*100), diffKwh:r2(e.predKwh-e.actKwh) });
   }
   from=Math.max(from, t-HIST_DAYS*DAY);
   for (let day=startOfDay(new Date(from)); day.getTime()<=t; day=addDays(day,1)){
@@ -523,7 +606,7 @@ function addLevel(history, pct, how, now){
 // Ask about a reading (history entry from addReading()) far off the estimate: "low" (car below it) or "high",
 // else null. Needs 5+ points; when the interval had a drive (logged, a socLog entry), also deviates().
 function readingQuestion(reading, logged, s){
-  if (!reading || reading.diffKwh==null || Math.abs(reading.diffKwh)<0.05*s.battery) return null;
+  if (!reading || reading.diffKwh==null || Math.abs(reading.diffKwh)<0.05*capacity(s)) return null;
   if (logged && !deviates(logged, s)) return null;
   return reading.diffKwh<0 ? "low" : "high";
 }
@@ -551,7 +634,7 @@ function setErrand(s, at, km, now){
   const old=s.errands.find(e=>e.at===at)?.km || 0;
   const errands=[...s.errands.filter(e=>e.at!==at && e.at>keep), ...(km>0 ? [{ at, km }] : [])].sort((a,b)=>a.at-b.at);
   const rest=s.history.filter(e=>!(e.k==="drive" && e.src==="errand" && e.at===at));
-  const soc=missedMs(s, at-1, at)>0 ? Math.min(100, Math.max(0, s.soc-kwhFor(km-old, new Date(at), s)/s.battery*100)) : s.soc;
+  const soc=missedMs(s, at-1, at)>0 ? Math.min(100, Math.max(0, s.soc-kwhFor(km-old, new Date(at), s)/capacity(s)*100)) : s.soc;
   return { errands, history: km>0 && at<=t ? histSort([...rest, errandEntry({ at, km }, s)], t) : rest, soc };
 }
 // An errand told with a reading at `at` (it explains a low reading with no drive logged): just before the reading,
@@ -603,7 +686,7 @@ function recentDays(prices, s, now, k, days=7){
 // days) against the cheapest home hours of each day, k = hours to charge from the reserve to the charge limit.
 // null with under 3 days of history.
 function cheapLimit(prices, s, now){
-  const k=Math.max(1, Math.ceil(s.battery*(s.maxSoc-s.reserve)/100/(s.chargerKw*s.effPct/100)));
+  const k=Math.max(1, Math.ceil(capacity(s)*(s.maxSoc-s.reserve)/100/(s.chargerKw*s.effPct/100)));
   const days=recentDays(prices, s, now, k), n=days.length;
   return n<3 ? null : days[n-Math.ceil(0.7*n-1e-9)];
 }
@@ -690,7 +773,7 @@ function addCharge(s, now, w){
     planned=[...planned.flatMap(([x,y,...c])=>cut(x,y).map(w=>[...w,...c])), [a, b, 1]].sort((x,y)=>x[0]-y[0]);
     history=history.flatMap(h=>h.k!=="charge" ? [h] : cut(h.at,h.end).map(([x,y])=>({ ...h, at:x, end:y, kwh:r2((y-x)/H*kw) })));
     if (e<=t) history=histSort([...history, { k:"charge", at:a, end:b, kwh:r2((b-a)/H*kw), chosen:true }], t);
-    soc=Math.min(100, soc+(missedMs(s, a, b)-before)/H*kw/s.battery*100);
+    soc=Math.min(100, soc+(missedMs(s, a, b)-before)/H*kw/capacity(s)*100);
   }
   if (e>t){
     const win=[Math.max(a,t), e], c=commit && commit.until>t ? commit : null;
@@ -823,5 +906,5 @@ export {
   H, DEF, STORE, LIMITS, clone, getPath, setPath, clampSetting, migrateTariffs, settingsFrom,
   pad, dateKey, DOW, shortDay, monIdx, atTime, startOfDay, addDays, hhmm, round5, hm5, dayLabel,
   SEASON, consFor, isTariffWinter, tariff, priceParts, totalPrice, wpow, features, fitModel, parsePrices, demoData, setErrand, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor,
-  buildHours, drivesFor, plan, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom, timerWindow, addCharge, missedMs
+  buildHours, drivesFor, plan, capEstimate, capacity, logCharge, chargeDraft, chargePrompt, readStart, fmtKr, pct, decide, LOG_MAX, drivesDone, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, HIST_DAYS, logReading, relogKm, deviates, usableReading, readingQuestion, explainReading, addErrand, limitFor, commitFrom, timerWindow, addCharge, missedMs
 };

@@ -2,7 +2,7 @@
 // Usage: TZ=Europe/Copenhagen node tests/plan.test.js
 import fs from "node:fs";
 import assert from "node:assert";
-import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, setErrand, logReading, relogKm, deviates, commitFrom, timerWindow, addCharge } from "../ladeplan.js";
+import { demoData, buildHours, plan, DEF, clone, parsePrices, decide, settingsFrom, tariff, priceParts, totalPrice, round5, hm5, hhmm, oneWindow, recentDays, cheapLimit, priceRating, kmOn, patternKm, commuteOn, kwhFor, startOfDay, addDays, atTime, notePlanned, levelEst, socEstimate, readingEst, rollLevel, recordHistory, addReading, addLevel, correctDrive, historyCsv, usableReading, readingQuestion, explainReading, addErrand, setErrand, logReading, relogKm, deviates, commitFrom, timerWindow, addCharge, capEstimate, capacity, logCharge, chargeDraft, chargePrompt, readStart } from "../ladeplan.js";
 
 if (process.env.TZ !== "Europe/Copenhagen") {
   console.error("Run with TZ=Europe/Copenhagen (the app assumes device time = Danish time).");
@@ -1051,6 +1051,131 @@ test("impossible consumption is not usable, without an answer", () => {
   const neg = readAt(s, "2026-10-19T18:00", 85).logged;   // higher than before the drive
   assert.ok(neg.actKwh < 0 && !usableReading(neg));
   assert.ok(!usableReading(readAt(s, "2026-10-19T18:00", 20).logged));   // 34.8 kWh for 78 km = 45 kWh/100 km
+});
+
+/* ---------- battery capacity from logged charging ---------- */
+// Sessions from a battery of 54 kWh at 90%: k = 0.6 grid kWh per point. The true levels have decimals; the car
+// shows them rounded, so each session is up to ±1 point off.
+const DAYMS = 864e5, T0 = new Date("2026-11-01T07:00").getTime();
+const sess = (i, from, to, o = {}) => ({ at: T0 + i * DAYMS, from: Math.round(from), to: Math.round(to), kwh: Math.round((to - from) * 0.6 * 100) / 100, estStart: false, preheat: false, ...o });
+const TRUE = [[30.4, 90.3], [41.6, 80.4], [22.5, 79.6], [55.4, 90.4], [35.3, 85.6]];
+const capS = (charges, o = {}) => ({ ...clone(DEF), charges, ...o });
+
+test("capacity estimate recovers 54 kWh through display rounding", () => {
+  const e = capEstimate(capS(TRUE.map(([a, b], i) => sess(i, a, b))));
+  assert.strictEqual(e.n, 5);
+  assert.ok(Math.abs(e.B - 54) < 1, `got ${e.B}`);
+  assert.ok(e.pm > 0 && e.pm < 2, `± ${e.pm}`);
+  assert.ok(e.active);
+  for (const r of e.rows) assert.ok(Math.abs(r.B - 54) < 2.5);
+});
+
+test("capacity estimate leaves out short and pre-heated sessions", () => {
+  const good = TRUE.slice(0, 3).map(([a, b], i) => sess(i, a, b));
+  const e = capEstimate(capS([...good, { ...sess(3, 70, 85), kwh: 15 }, { ...sess(4, 30, 80), kwh: 40, preheat: true }]));
+  assert.deepStrictEqual(e.rows.map(r => r.why), [null, null, null, "under 20 points", "pre-heated"]);
+  assert.strictEqual(e.n, 3);
+  assert.ok(Math.abs(e.B - 54) < 1);
+});
+
+test("capacity estimate drops an outlier once there are 4 sessions", () => {
+  const odd = (i) => ({ ...sess(i, 30, 80), kwh: 40 });   // k = 0.8: 72 kWh
+  const four = capEstimate(capS([...TRUE.slice(0, 3).map(([a, b], i) => sess(i, a, b)), odd(3)]));
+  assert.strictEqual(four.rows[3].why, "outlier");
+  assert.ok(Math.abs(four.B - 54) < 1);
+  const three = capEstimate(capS([...TRUE.slice(0, 2).map(([a, b], i) => sess(i, a, b)), odd(2)]));
+  assert.strictEqual(three.n, 3);
+  assert.ok(three.B > 58 && three.pm > 3, `${three.B} ± ${three.pm}`);   // kept, with a wide ±
+});
+
+test("capacity estimate uses the last 10 sessions within 60 days", () => {
+  const many = Array.from({ length: 12 }, (_, i) => sess(i, 30, 80));
+  assert.deepStrictEqual(capEstimate(capS(many)).rows.map(r => r.why).slice(0, 3), ["older", "older", null]);
+  const gap = [{ ...sess(-70, 30, 80), kwh: 40 }, ...TRUE.slice(0, 3).map(([a, b], i) => sess(i, a, b))];
+  const e = capEstimate(capS(gap));
+  assert.strictEqual(e.rows[0].why, "older");
+  assert.ok(Math.abs(e.B - 54) < 1);
+});
+
+test("estimated capacity is used from 3 sessions with a read start, or when chosen", () => {
+  const two = [sess(0, 30, 90), sess(1, 40, 80), sess(2, 25, 85, { estStart: true })];
+  const auto = capEstimate(capS(two));
+  assert.ok(!auto.active && auto.nRead === 2 && auto.n === 3);
+  assert.strictEqual(capacity(capS(two)), 58);
+  assert.ok(Math.abs(capacity(capS(two, { useEstCap: true })) - 54) < 1);
+  const three = TRUE.slice(0, 3).map(([a, b], i) => sess(i, a, b));
+  assert.strictEqual(capacity(capS(three, { useEstCap: false })), 58);
+  assert.ok(Math.abs(capacity(capS(three)) - 54) < 1);
+  assert.strictEqual(capacity(capS([], { useEstCap: true })), 58);
+  // An estimated start counts half and widens the ±
+  const est = capEstimate(capS([sess(0, 30, 90, { estStart: true })], { useEstCap: true }));
+  const read = capEstimate(capS([sess(0, 30, 90)], { useEstCap: true }));
+  assert.ok(est.pm > 2 * read.pm);
+});
+
+test("the planner charges grid kWh = points × k with the estimate in use", () => {
+  const charges = TRUE.map(([a, b], i) => sess(i, a, b)), e = capEstimate(capS(charges));
+  const { P, s } = run("2026-11-18T19:00", s => { s.soc = 20; s.charges = charges; });
+  assert.ok(Math.abs(P.B - e.B) < 1e-9);
+  const pts = P.slots.reduce((a, sl) => a + sl.charge, 0) / P.B * 100, grid = P.blocks.reduce((a, b) => a + b.kwh, 0);
+  assert.ok(pts > 5, `${pts} points`);
+  assert.ok(Math.abs(grid / pts - e.k) < 1e-9);
+  for (const ev of P.events.filter(ev => ev.check)) assert.ok(ev.lvlAfter >= P.B * s.reserve / 100 - 0.05);
+});
+
+test("logged charges are stored, cleaned and replaced by time", () => {
+  const s = stored({ charges: [sess(1, 30, 90), { at: 5, from: 30, to: 120, kwh: 10 }, { at: 6, from: 30, to: 80, kwh: -1 }, { ...sess(0, 40, 80), estStart: "yes" }], useEstCap: "x" });
+  assert.strictEqual(s.charges.length, 2);
+  assert.ok(s.charges[0].at < s.charges[1].at && s.charges[0].estStart === false);
+  assert.strictEqual(s.useEstCap, null);
+  assert.strictEqual(stored({ useEstCap: false }).useEstCap, false);
+  const c = logCharge(s.charges, { ...sess(1, 31, 90), kwh: 35.31 });
+  assert.deepStrictEqual([c.length, c[1].from, c[1].kwh], [2, 31, 35.31]);
+});
+
+test("log charge form starts from the levels around the last charging", () => {
+  const now = new Date("2026-11-19T08:00"), at = iso => new Date(iso).getTime();
+  const base = { ...clone(DEF), maxSoc: 80 };
+  const reading = (iso, pct) => ({ k: "reading", at: at(iso), pct });
+  const charge = (a, b) => ({ k: "charge", at: at(a), end: at(b), kwh: 11, chosen: true });
+  const history = [reading("2026-11-18T17:30", 61), charge("2026-11-18T22:00", "2026-11-19T01:00"), charge("2026-11-19T01:00", "2026-11-19T02:30"), reading("2026-11-19T07:00", 90)];
+  assert.deepStrictEqual(chargeDraft({ ...base, history }, now),
+    { at: at("2026-11-19T02:30"), from: 61, to: 90, estStart: false, startAt: at("2026-11-18T17:30"), endAt: at("2026-11-19T07:00") });
+  // A reading during a window is neither the start nor the end
+  const mid = [history[0], history[1], reading("2026-11-19T00:30", 75), history[2], reading("2026-11-19T02:00", 85), history[3]];
+  const m = chargeDraft({ ...base, history: mid }, now);
+  assert.deepStrictEqual([m.from, m.to, m.estStart], [61, 90, false]);
+  // A "Use" level before it is an estimate; a drive before the next reading means no end reading
+  const h2 = [{ k: "level", at: at("2026-11-18T17:30"), pct: 60.6, how: "use" }, history[1], { k: "drive", at: at("2026-11-19T07:30") }, reading("2026-11-19T17:00", 70)];
+  const d2 = chargeDraft({ ...base, history: h2 }, now);
+  assert.deepStrictEqual([d2.at, d2.from, d2.to, d2.estStart, d2.endAt], [at("2026-11-19T01:00"), 61, 80, true, null]);
+  assert.strictEqual(chargeDraft({ ...base, history: [] }, now).to, 80);
+});
+
+test("log this charge is asked only when both ends were read from the car", () => {
+  const now = new Date("2026-11-19T07:05"), at = iso => new Date(iso).getTime(), t7 = at("2026-11-19T07:00");
+  const read = (iso, pct, o = {}) => ({ k: "reading", at: at(iso), pct, ...o });
+  const charge = { k: "charge", at: at("2026-11-18T22:00"), end: at("2026-11-19T02:30"), kwh: 33, chosen: true };
+  const s = (start, end = read("2026-11-19T07:00", 90), o = {}) => ({ ...clone(DEF), history: [start, charge, end], soc: end.pct, socAt: end.at, readAt: end.at, readSoc: end.pct, ...o });
+  const ok = s(read("2026-11-18T17:30", 61));
+  assert.deepStrictEqual([chargePrompt(ok, now).from, chargePrompt(ok, now).to], [61, 90]);
+  assert.strictEqual(chargePrompt(s({ k: "level", at: at("2026-11-18T17:30"), pct: 61, how: "use" }), now), null);   // estimate
+  assert.strictEqual(chargePrompt(s(read("2026-11-18T17:30", 75)), now), null);                                    // 15 points
+  assert.strictEqual(chargePrompt(s(read("2026-11-18T17:30", 61), read("2026-11-19T07:00", 90, { cause: "charged-elsewhere" })), now), null);
+  assert.strictEqual(chargePrompt({ ...ok, chargeSkip: charge.end }, now), null);
+  assert.strictEqual(chargePrompt({ ...ok, charges: [{ at: charge.end, from: 61, to: 90, kwh: 35, estStart: false, preheat: false }] }, now), null);
+  assert.strictEqual(chargePrompt({ ...ok, socAt: t7 + 60e3 }, now), null);   // the level has moved on since ("Use")
+  assert.strictEqual(stored({ chargeSkip: "x" }).chargeSkip, null);
+});
+
+test("a read start: the level is a reading with no drive or charging since", () => {
+  const now = new Date("2026-11-18T19:00"), t = new Date("2026-11-18T18:00").getTime();
+  const s = { ...clone(DEF), pattern: [0,0,0,0,0,0,0], soc: 40, socAt: t, readAt: t, readSoc: 40 };
+  assert.ok(readStart(s, now));
+  assert.ok(!readStart({ ...s, socAt: t + 1 }, now));                                       // "Use" or moved forward
+  assert.ok(!readStart({ ...s, planned: [[t + 10 * 60e3, t + 40 * 60e3]] }, now));          // charging since
+  assert.ok(!readStart({ ...s, errands: [{ at: t + 30 * 60e3, km: 20 }] }, now));           // a drive since
+  assert.ok(!readStart({ ...s, readAt: null }, now));
 });
 
 console.log(failed ? `\n${failed} failed` : "\nall passed");
