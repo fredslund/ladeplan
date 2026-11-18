@@ -175,6 +175,7 @@ a.inl{color:var(--known)}
     <input type="range" id="soc" min="0" max="100" step="1">
     <output id="socOut">–</output>
     <div class="socup" id="socUpdate" aria-live="polite" hidden></div>
+    <div class="socup" id="plugNote" hidden></div>
     <div class="socup" id="xPanel" hidden></div>
     <div class="soclinks"><button type="button" class="linkbtn" id="xOpen" aria-expanded="false" aria-controls="xPanel">Extra drive</button>
       <button type="button" class="linkbtn" id="cOpen" aria-expanded="false" aria-controls="xPanel">Charging</button>
@@ -236,6 +237,7 @@ a.inl{color:var(--known)}
     <a href="#" class="btn ghost close">Done</a>
   </header>
   <p class="note">What the app assumes happened, for checking against the car. Drives follow your schedule and km corrections; charging is what the plan showed (assumed) or what you chose; readings are levels you set from the car. Kept for 120 days.</p>
+  <section class="card lday" id="chargeCard" aria-labelledby="chargeTitle"></section>
   <div id="logList" class="view"></div>
   <div class="row"><button type="button" class="btn ghost" id="logCsv">Copy as CSV</button><span class="note" id="logCsvMsg" aria-live="polite"></span></div>
   <textarea class="csvout" id="logCsvOut" readonly hidden aria-label="History as CSV"></textarea>
@@ -268,6 +270,8 @@ a.inl{color:var(--known)}
         <label class="field"><span>Always fill below (kr/kWh)</span><input type="number" id="cheapFill" data-k="cheapFill" step="0.05"></label>
         <label class="field"><span>One timer window if extra cost under (kr)</span><input type="number" id="oneWindowKr" data-k="oneWindowKr" step="1"></label>
       </div>
+      <p class="note" id="capEst"></p>
+      <label class="check" id="capUseRow" hidden><input type="checkbox" id="capUse"> Use the estimated capacity instead of the usable battery set above</label>
       <label class="check"><input type="checkbox" id="fillCheap" data-k="fillCheap"> Top up to the charge limit when the price is cheap compared with the last 7 days</label>
       <p class="note">The charge limit can be exceeded if a long trip needs it. Set "always fill" to 0 to turn it off. Charging is planned as one timer window per session unless splitting saves more than the amount set.</p>
       <p class="label" style="margin:6px 0 0">Consumption by season, kWh/100 km</p>
@@ -323,7 +327,7 @@ import {
   H, STORE, LIMITS, getPath, setPath, clampSetting, pad, dateKey, DOW, shortDay,
   startOfDay, addDays, atTime, hhmm, hm5, dayLabel, SEASON, isTariffWinter, wpow, parsePrices, demoData,
   buildHours, plan, cheapLimit, fmtKr, pct, decide, settingsFrom, kmOn, patternKm, commitFrom, addCharge, notePlanned, logReading, relogKm, levelEst, readingEst, rollLevel, readingQuestion, explainReading, addErrand, setErrand,
-  recordHistory, addReading, addLevel, correctDrive, historyCsv
+  recordHistory, addReading, addLevel, correctDrive, historyCsv, capEstimate, capacity, logCharge, chargeDraft, chargePrompt, readStart
 } from "./ladeplan.js";
 
 /* ---------- storage ---------- */
@@ -370,13 +374,28 @@ let DATA=null, MODEL=null, DEMO=false;
 // SOC_SET: the level as of S.socAt (S.soc follows the slider while dragging). ASK: after a reading far off the
 // estimate, what to ask ({ dir: low|high, at, date: logged drive day or null, charging, km: field shown }).
 // KM_OPEN: the km field under the estimate is shown.
-let SOC_SET=S.soc, ASK=null, KM_OPEN=false;
+// CP: the "Log this charge?" values ({ at, kwh, preheat }), kept across re-renders.
+let SOC_SET=S.soc, ASK=null, KM_OPEN=false, CP=null;
 
 // Set the level as of now: a reading of the car (slider), or an estimate ("Use", rollLevel()) kept unrounded
 function setSoc(v, now, reading){
   S.soc=SOC_SET=v; S.socAt=now.getTime();
   if (reading){ S.readAt=S.socAt; S.readSoc=v; }
   document.getElementById("soc").value=Math.round(v); document.getElementById("socOut").textContent=Math.round(v)+"%";
+}
+// A reading of the car at S.soc (slider moved, or "Car shows" before charging). After a drive it's logged against
+// the estimate.
+function takeReading(){
+  const now=new Date(), t=now.getTime();
+  // Charging since the last reading (or level), for the "didn't run fully" answer
+  const sinceRead=levelEst(S.readAt ? {...S, soc:S.readSoc, socAt:S.readAt} : {...S, soc:SOC_SET}, now);
+  S.socLog=logReading(S.socLog, readingEst(S, now), S.soc, S, now);
+  S.history=addReading(S.history, levelEst({...S, soc:SOC_SET}, now), S.soc, capacity(S), now, sinceRead ? sinceRead.chargedKwh : 0);
+  const last=S.socLog[S.socLog.length-1], logged=last && last.at===t ? last : null;
+  const reading=S.history.findLast(e=>e.k==="reading"), dir=readingQuestion(reading, logged, S);
+  ASK = dir ? { dir, at:reading.at, date:logged ? logged.date : null, charging:reading.chargedKwh>0.05, km:false } : null;
+  KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
+  if (!document.getElementById("logView").hidden) renderLog();
 }
 // Store a change from setErrand(), addErrand() or addCharge(); the level may have been corrected for it
 function applyChange({ soc, ...rest }){
@@ -393,7 +412,8 @@ function setKm(key, v){
 function renderSocUpdate(now){
   const box=document.getElementById("socUpdate");
   const lv=levelEst({...S, soc:SOC_SET}, now), est=lv && lv.trips.length ? lv : null, last=S.socLog[S.socLog.length-1];
-  const refocus=document.activeElement && document.activeElement.id==="socKmIn";
+  const refocus=document.activeElement && document.activeElement.id==="socKmIn", cpFocus=document.activeElement && document.activeElement.id==="cpKwh";
+  const cp=!DEMO && !est && !ASK ? chargePrompt(S, now) : null;
   // The field always edits the whole day's km; say so when only one drive of it is counted
   const kmField=(key, half)=>{ const d=new Date(key+"T12:00");
     return `<label class="field"><span>Km driven ${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}${half?" (round trip)":""}</span><input type="number" min="0" step="1" id="socKmIn" data-day="${key}" value="${kmOn(d,S)}"></label>`; };
@@ -453,11 +473,32 @@ function renderSocUpdate(now){
       if (!document.getElementById("logView").hidden) renderLog();
     };
   }
+  else if (cp){
+    // Charging that started and ended with a reading of the car: ask for the wallbox's kWh (capEstimate())
+    if (!CP || CP.at!==cp.at) CP={ at:cp.at, kwh:"", preheat:false };
+    box.innerHTML=`<p><b>Log this charge?</b> <span class="num">${cp.from}% → ${cp.to}%</span></p>
+      <p class="note">The wallbox's kWh for it improves the estimate of the usable battery.</p>
+      <div class="row"><label class="field"><span>Wallbox kWh</span><input type="number" min="0" step="0.01" id="cpKwh" value="${CP.kwh}"></label></div>
+      <label class="check"><input type="checkbox" id="cpPre"${CP.preheat?" checked":""}> Pre-heated while plugged in (left out)</label>
+      <p class="note err" id="cpErr" hidden></p>
+      <div class="row"><button type="button" class="btn" id="cpSave">Save</button><button type="button" class="linkbtn" id="cpSkip">Not now</button></div>${ageNote}`;
+    const $=id=>document.getElementById(id), done=()=>{ CP=null; saveSettings(); renderCap(); renderSocUpdate(new Date()); if (!$("logView").hidden) renderLog(); $("soc").focus(); };
+    $("cpKwh").oninput=e=>{ CP.kwh=e.target.value; };
+    $("cpPre").onchange=e=>{ CP.preheat=e.target.checked; };
+    $("cpSave").onclick=()=>{
+      const kwh=Number(CP.kwh);
+      if (!(kwh>0)){ $("cpErr").hidden=false; $("cpErr").textContent="Enter the kWh the wallbox shows for this charge."; return; }
+      S.charges=logCharge(S.charges, { at:cp.at, from:cp.from, to:cp.to, kwh, estStart:false, preheat:CP.preheat });
+      done(); recompute();
+    };
+    $("cpSkip").onclick=()=>{ S.chargeSkip=cp.at; done(); };
+    if (cpFocus) $("cpKwh").focus();
+  }
   else if (lv && lv.chargedKwh>0.05){
     // No drive since, but planned charging: the plan assumes it ran, so show it (and catch a session that didn't)
     const t=now.getTime(), running=S.planned.some(([a,b])=>a<=t && b>t);
     box.innerHTML=`<p><b>${running?"Charging":"Charged?"}</b> Estimated <span class="num">${lv.pct}%</span>${running?" so far":""}</p>
-      <p class="note">${from(lv)}${charged(lv)}. The plan uses this; or set the slider to what the car shows.</p>
+      <p class="note">${from(lv)}${charged(lv)}. The plan uses this; or set the slider to what the car shows${!running && S.socAt===S.readAt && lv.chargedKwh/lv.B*100>=20 ? ", which also lets you log this charge for the battery estimate" : ""}.</p>
       ${useBtn(lv)}${ageNote}`;
     bindUse(lv);
   }
@@ -766,24 +807,14 @@ function bindInputs(){
       if (k==="area") return load();
       if (el.dataset.k==="kmOneWay") renderTrips(new Date());
       if (el.dataset.k.startsWith("cons.")) renderMonths();
+      if (k==="battery" || k==="effPct") renderCap();
       recompute();
     });
   });
   const soc=document.getElementById("soc"), out=document.getElementById("socOut");
   soc.value=Math.round(S.soc); out.textContent=Math.round(S.soc)+"%";
   soc.addEventListener("input",()=>{ S.soc=Number(soc.value); out.textContent=S.soc+"%"; recompute(); });
-  // A slider change is a reading of the car. After a drive it's logged against the estimate.
-  soc.addEventListener("change",()=>{
-    const now=new Date(), t=now.getTime();
-    // Charging since the last reading (or level), for the "didn't run fully" answer
-    const sinceRead=levelEst(S.readAt ? {...S, soc:S.readSoc, socAt:S.readAt} : {...S, soc:SOC_SET}, now);
-    S.socLog=logReading(S.socLog, readingEst(S, now), S.soc, S, now);
-    S.history=addReading(S.history, levelEst({...S, soc:SOC_SET}, now), S.soc, S.battery, now, sinceRead ? sinceRead.chargedKwh : 0);
-    const last=S.socLog[S.socLog.length-1], logged=last && last.at===t ? last : null;
-    const reading=S.history.findLast(e=>e.k==="reading"), dir=readingQuestion(reading, logged, S);
-    ASK = dir ? { dir, at:reading.at, date:logged ? logged.date : null, charging:reading.chargedKwh>0.05, km:false } : null;
-    KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
-  });
+  soc.addEventListener("change",()=>takeReading());
   // Each link opens its form, or closes it if it is the one open
   document.getElementById("xOpen").addEventListener("click",()=>{
     XD = XD?.kind==="drive" ? null : { kind:"drive", km:"", time:hhmm(Date.now()) }; renderExtra(); if (XD) document.getElementById("xKm").focus();
@@ -792,13 +823,69 @@ function bindInputs(){
     const t=Date.now(), lim=Math.min(100, Math.max(50, Math.round(S.maxSoc/10)*10));
     XD = XD?.kind==="charge" ? null : { kind:"charge", start:hhmm(t), end:hhmm(Math.ceil((t+H)/H)*H), limit:lim }; renderExtra(); if (XD) document.getElementById("xStart").focus();
   });
+  document.getElementById("capUse").addEventListener("change", e=>{ S.useEstCap=e.target.checked; saveSettings(); renderCap(); recompute(); });
   document.getElementById("reload").addEventListener("click",()=>{ DEMO=false; load(); });
   document.getElementById("demo").addEventListener("click",()=>{ DEMO=true; load(); });
+}
+
+// Settings: the capacity estimated from logged charging (capEstimate()) and whether the plan uses it
+const capText=e=>`${Math.round(e.B)} ± ${Math.max(1, Math.round(e.pm))} kWh (${e.n} charge${e.n>1?"s":""}${e.n>e.nRead?`, ${e.n-e.nRead} with an estimated start`:""})`;
+function renderCap(){
+  const e=capEstimate(S), note=document.getElementById("capEst"), row=document.getElementById("capUseRow");
+  row.hidden=!e.n; document.getElementById("capUse").checked=e.active;
+  note.innerHTML=!e.n ? `Log charging with the wallbox's kWh in <a href="#log" class="inl">History</a> to estimate the usable capacity.`
+    : `Estimated usable capacity: ${capText(e)}, at the charging efficiency set. `
+      + (e.active ? `The plan uses ${e.B.toFixed(1)} kWh.` : S.useEstCap===false ? "Not in use." : `Used once 3 charges have a start % read from the car.`);
+}
+
+// History: logged charging sessions for the capacity estimate. LC: the Log charge form ({ at, date, from, to, kwh,
+// estStart, preheat }, from chargeDraft()) or null, kept across re-renders.
+let LC=null;
+function renderCharges(){
+  const box=document.getElementById("chargeCard"), e=capEstimate(S), $=id=>document.getElementById(id);
+  const day=t=>{ const d=new Date(t); return `${DOW[d.getDay()]} ${d.getDate()}/${d.getMonth()+1}`; };
+  const rows=[...e.rows].reverse().map(r=>`<div class="lrow"><span class="when">${day(r.at)}</span><span class="what">${Math.round(r.from)}% → ${Math.round(r.to)}% · ${r.kwh} kWh<small>${r.k==null ? "No gain" : `${r.k.toFixed(3)} kWh per point · ${r.B.toFixed(1)} kWh`}${r.estStart?" · start estimated":""}${r.preheat?" · pre-heated":""}${r.why?` · left out: ${r.why}`:""}</small></span><span class="val"><button type="button" class="linkbtn" data-at="${r.at}" aria-label="Remove charge ${day(r.at)}">Remove</button></span></div>`).join("");
+  const form=!LC ? `<div class="row"><button type="button" class="btn ghost" id="lcOpen">Log charge</button></div>`
+    : `<div class="socup">
+      <div class="grid2"><label class="field"><span>Ended</span><input type="date" id="lcDate" value="${LC.date}"></label>
+        <label class="field"><span>Wallbox kWh</span><input type="number" min="0" step="0.01" id="lcKwh" value="${LC.kwh}"></label>
+        <label class="field"><span>Start %</span><input type="number" min="0" max="100" step="1" id="lcFrom" value="${LC.from ?? ""}"></label>
+        <label class="field"><span>End %</span><input type="number" min="0" max="100" step="1" id="lcTo" value="${LC.to}"></label></div>
+      <label class="check"><input type="checkbox" id="lcEst"${LC.estStart?" checked":""}> Start % is an estimate, not read from the car</label>
+      <label class="check"><input type="checkbox" id="lcPre"${LC.preheat?" checked":""}> Pre-heated while plugged in (left out)</label>
+      <p class="note err" id="lcErr" hidden></p>
+      <div class="row"><button type="button" class="btn" id="lcSave">Save</button><button type="button" class="linkbtn" id="lcCancel">Cancel</button></div></div>`;
+  box.innerHTML=`<h2 class="sh" id="chargeTitle">Charging sessions</h2>
+    <p class="note">${e.n ? `Estimated usable capacity: ${capText(e)}${e.active?", in use":""}.` : "Log the wallbox's kWh for a charge of 20 points or more to estimate the usable capacity."} Logging the same charge again replaces it.</p>
+    ${rows}${form}`;
+  for (const b of box.querySelectorAll("[data-at]")) b.onclick=()=>{
+    S.charges=S.charges.filter(c=>c.at!==Number(b.dataset.at)); saveSettings(); renderCharges(); renderCap(); recompute();
+  };
+  if (!LC){ $("lcOpen").onclick=()=>{ const d=chargeDraft(S, new Date()); LC={ ...d, date:dateKey(new Date(d.at)), kwh:"", preheat:false }; renderCharges(); $("lcKwh").focus(); }; return; }
+  const close=()=>{ LC=null; renderCharges(); $("lcOpen").focus(); };
+  $("lcDate").oninput=ev=>{ LC.date=ev.target.value; };
+  $("lcKwh").oninput=ev=>{ LC.kwh=ev.target.value; };
+  $("lcFrom").oninput=ev=>{ LC.from=ev.target.value; };
+  $("lcTo").oninput=ev=>{ LC.to=ev.target.value; };
+  $("lcEst").onchange=ev=>{ LC.estStart=ev.target.checked; };
+  $("lcPre").onchange=ev=>{ LC.preheat=ev.target.checked; };
+  $("lcCancel").onclick=close;
+  $("lcSave").onclick=()=>{
+    const from=Number(LC.from), to=Number(LC.to), kwh=Number(LC.kwh), err=$("lcErr");
+    if (!LC.date || LC.from==null || String(LC.from).trim()==="" || !(from>=0 && to<=100 && to>from) || !(kwh>0)){
+      err.hidden=false; err.textContent="Enter the date, the wallbox's kWh, and a start % below the end %."; return;
+    }
+    // The drafted charge keeps its time, so logging it again replaces it; another date is logged at noon
+    const at=dateKey(new Date(LC.at))===LC.date ? LC.at : new Date(LC.date+"T12:00").getTime();
+    S.charges=logCharge(S.charges, { at, from, to, kwh, estStart:LC.estStart, preheat:LC.preheat });
+    saveSettings(); renderCap(); recompute(); close();
+  };
 }
 
 // History view: days newest first, entries in order within a day
 const CAUSE={ drove:"Distance corrected", "charging-short":"Charging didn't run fully", "charged-elsewhere":"Charged extra", ok:"Just off" };
 function renderLog(){
+  renderCharges();
   const list=document.getElementById("logList"), now=new Date();
   if (!S.history.length){ list.innerHTML=`<p class="note">Nothing yet. Drives and charging appear here once they have happened.</p>`; return; }
   const kwh=(v, sign)=>`${v<0?"−":sign?"+":""}${Math.abs(v).toFixed(1)} kWh`;
@@ -815,6 +902,21 @@ function renderLog(){
       : row(hhmm(e.at), `${e.how==="use"?"Estimate used":"Moved forward"} · ${Math.round(e.pct)}%`, "Estimate, not a reading")
     ).join("")}</section>`;
   }).join("");
+}
+
+// Before planned charging of CAP_MIN+ points with no reading of the car since the last drive or charging: ask for
+// one when plugging in, so the session can be logged for the capacity estimate (chargePrompt() needs a read start).
+// "Car shows" confirms the level the app has; moving the slider adjusts it. Both are readings.
+function renderPlugNote(P, now){
+  const box=document.getElementById("plugNote"), t=now.getTime(), dep=P.events.find(e=>e.check)?.t ?? Infinity;
+  const sess=P.blocks.filter(b=>b.end>t && b.start<dep), first=sess[0];
+  const pts=sess.reduce((a,b)=>a+b.kwh, 0)*S.effPct/100/P.B*100;
+  if (DEMO || !first || first.start<=t || pts<20 || readStart({...S, soc:SOC_SET}, now)){ box.hidden=true; box.innerHTML=""; return; }
+  const lv=levelEst({...S, soc:SOC_SET}, now), v=lv ? lv.pct : Math.round(SOC_SET), dl=dayLabel(first.start, now);
+  box.hidden=false;
+  box.innerHTML=`<p class="note">Charging from ${first.start-t<18*H ? "" : dl==="Tomorrow" ? "tomorrow " : dl+" "}${hm5(first.start)}. When you plug in, check the car's level so the charge can be logged for the battery estimate.</p>
+    <div class="row"><button type="button" class="btn ghost" id="plugOk">Car shows ${v}%</button><span class="note">or move the slider</span></div>`;
+  document.getElementById("plugOk").onclick=()=>{ S.soc=v; takeReading(); };
 }
 
 function recompute(){
@@ -841,7 +943,7 @@ function recompute(){
     // The Battery card shows the stored windows ("Charging … so far"), so redraw it when they change
     if (JSON.stringify(pl)!==JSON.stringify(S.planned)){ S.planned=pl; saveSettings(); renderSocUpdate(now); }
   }
-  renderDecision(P, now); renderChart(P, now); renderTimeline(P, now);
+  renderDecision(P, now); renderChart(P, now); renderTimeline(P, now); renderPlugNote(P, now);
   if (model) document.getElementById("modelInfo").textContent =
     `The forecast fits a simple model on the last three weeks (${model.n} hours): price against wind and solar forecasts for West Denmark and North Germany, temperature, hour of day and weekend. Typical error over the past week: ±${fmtKr(model.mae/1000*1.25)} kr/kWh. Forecast hours are ranked slightly pessimistically, so the plan only waits for a forecast when it is clearly cheaper.`;
 }
@@ -908,7 +1010,7 @@ if (typeof document!=="undefined" && document.getElementById("decision")){
   });
   views();
   document.getElementById("tariffNow").textContent=`Now: ${isTariffWinter(Date.now())?"high":"low"} season.`;
-  bindInputs(); renderHeader(); renderWeek(); renderMonths(); renderTrips(new Date()); load();
+  bindInputs(); renderHeader(); renderCap(); renderWeek(); renderMonths(); renderTrips(new Date()); load();
   document.addEventListener("visibilitychange",()=>{ if (document.visibilityState==="visible") load(); });
 }
 </script>
