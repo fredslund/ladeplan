@@ -62,9 +62,17 @@ h1 small{font-weight:400;color:var(--muted);font-size:13px;margin-left:6px}
 .rate b{font:600 11px var(--sans);text-transform:uppercase;letter-spacing:.06em;margin-right:6px;color:var(--muted)}
 .rate.cheap b{color:var(--good)}
 .rate.pricey b{color:var(--warn)}
-.soc{display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:12px}
+.soc{display:grid;grid-template-columns:1fr auto;align-items:center;gap:12px}
 .soc label{font-weight:600}
-.soc output{font:500 22px var(--mono);min-width:3.5ch;text-align:right}
+.soc input[type=range]{grid-column:1/-1;height:32px;margin:0}
+.socval{display:flex;align-items:center;gap:6px}
+.socval .step{width:40px;height:40px;border-radius:8px;border:1px solid var(--line);background:transparent;color:var(--known);font:500 22px var(--sans);line-height:1;cursor:pointer;touch-action:manipulation;user-select:none;-webkit-tap-highlight-color:transparent;-webkit-user-select:none}
+.socval .step:disabled{opacity:.35;cursor:default}
+.socnum{display:flex;align-items:baseline;font:500 22px var(--mono)}
+.socnum input[type=text]{font:inherit;width:3.4ch;padding:2px 0;text-align:right;background:transparent;border:0;border-bottom:1px dashed var(--line);border-radius:0}
+.socnum input[aria-invalid=true]{border-bottom-color:var(--warn);color:var(--warn)}
+.socsave{grid-column:1/-1;display:flex;align-items:center;gap:10px 14px;flex-wrap:wrap}
+.socsave[hidden]{display:none}
 .socup{grid-column:1/-1;display:flex;flex-direction:column;gap:8px;padding-top:12px;border-top:1px solid var(--line)}
 .socup[hidden]{display:none}
 .socup p{margin:0}
@@ -172,8 +180,16 @@ a.inl{color:var(--known)}
 
   <section class="card soc">
     <label for="soc">Battery now</label>
+    <div class="socval">
+      <button type="button" class="step" id="socDown" aria-label="1% less">−</button>
+      <span class="socnum"><input type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" id="socNum" autocomplete="off" aria-label="Battery level in percent, tap to type">%</span>
+      <button type="button" class="step" id="socUp" aria-label="1% more">+</button>
+    </div>
     <input type="range" id="soc" min="0" max="100" step="1">
-    <output id="socOut">–</output>
+    <div class="socsave" id="socSave" aria-live="polite" hidden>
+      <button type="button" class="btn" id="socSaveBtn">Save</button><button type="button" class="linkbtn" id="socCancel">Cancel</button>
+      <span class="note">Set it to what the car shows.</span>
+    </div>
     <div class="socup" id="socUpdate" aria-live="polite" hidden></div>
     <div class="socup" id="plugNote" hidden></div>
     <div class="socup" id="xPanel" hidden></div>
@@ -371,36 +387,49 @@ async function fetchWeather(){
 /* ---------- page state ---------- */
 const S = loadSettings();
 let DATA=null, MODEL=null, DEMO=false;
-// SOC_SET: the level as of S.socAt (S.soc follows the slider while dragging). ASK: after a reading far off the
+// PEND: a level being set on the Battery card (slider, typed or −/+), not saved until Save; the plan previews it.
+// S.soc stays the level as of S.socAt meanwhile, so nothing stored changes. ASK: after a reading far off the
 // estimate, what to ask ({ dir: low|high, at, date: logged drive day or null, charging, km: field shown }).
 // KM_OPEN: the km field under the estimate is shown.
 // CP: the "Log this charge?" values ({ at, kwh, preheat }), kept across re-renders.
-let SOC_SET=S.soc, ASK=null, KM_OPEN=false, CP=null;
+let PEND=null, ASK=null, KM_OPEN=false, CP=null;
 
-// Set the level as of now: a reading of the car (slider), or an estimate ("Use", rollLevel()) kept unrounded
-function setSoc(v, now, reading){
-  S.soc=SOC_SET=v; S.socAt=now.getTime();
-  if (reading){ S.readAt=S.socAt; S.readSoc=v; }
-  document.getElementById("soc").value=Math.round(v); document.getElementById("socOut").textContent=Math.round(v)+"%";
+// Show the level being set (PEND) or the level set: slider, number (unless being typed in), −/+ and Save
+function renderSocInput(){
+  const v=Math.round(PEND ?? S.soc), num=document.getElementById("socNum");
+  document.getElementById("soc").value=v;
+  if (document.activeElement!==num){ num.value=v; num.removeAttribute("aria-invalid"); }
+  document.getElementById("socDown").disabled=v<=0; document.getElementById("socUp").disabled=v>=100;
+  document.getElementById("socSave").hidden=PEND==null;
+  document.getElementById("socSaveBtn").textContent=`Save ${v}%`;
 }
-// A reading of the car at S.soc (slider moved, or "Car shows" before charging). After a drive it's logged against
-// the estimate.
-function takeReading(){
+// Change the level being set (clamped to 0–100) and preview the plan with it
+function pend(v){
+  PEND=Math.min(100, Math.max(0, Math.round(v))); renderSocInput(); recompute();
+}
+// Set the level as of now: a reading of the car (Save), or an estimate ("Use", rollLevel()) kept unrounded
+function setSoc(v, now, reading){
+  S.soc=v; S.socAt=now.getTime();
+  if (reading){ S.readAt=S.socAt; S.readSoc=v; }
+  renderSocInput();
+}
+// A reading of the car at v (Save, or "Car shows" before charging). After a drive it's logged against the estimate.
+function takeReading(v){
   const now=new Date(), t=now.getTime();
   // Charging since the last reading (or level), for the "didn't run fully" answer
-  const sinceRead=levelEst(S.readAt ? {...S, soc:S.readSoc, socAt:S.readAt} : {...S, soc:SOC_SET}, now);
-  S.socLog=logReading(S.socLog, readingEst(S, now), S.soc, S, now);
-  S.history=addReading(S.history, levelEst({...S, soc:SOC_SET}, now), S.soc, capacity(S), now, sinceRead ? sinceRead.chargedKwh : 0);
+  const sinceRead=levelEst(S.readAt ? {...S, soc:S.readSoc, socAt:S.readAt} : S, now);
+  S.socLog=logReading(S.socLog, readingEst(S, now), v, S, now);
+  S.history=addReading(S.history, levelEst(S, now), v, capacity(S), now, sinceRead ? sinceRead.chargedKwh : 0);
   const last=S.socLog[S.socLog.length-1], logged=last && last.at===t ? last : null;
   const reading=S.history.findLast(e=>e.k==="reading"), dir=readingQuestion(reading, logged, S);
   ASK = dir ? { dir, at:reading.at, date:logged ? logged.date : null, charging:reading.chargedKwh>0.05, km:false } : null;
-  KM_OPEN=false; setSoc(S.soc, now, true); saveSettings(); recompute();
+  KM_OPEN=false; PEND=null; setSoc(v, now, true); saveSettings(); recompute();
   if (!document.getElementById("logView").hidden) renderLog();
 }
 // Store a change from setErrand(), addErrand() or addCharge(); the level may have been corrected for it
 function applyChange({ soc, ...rest }){
   Object.assign(S, rest);
-  if (soc!==S.soc){ S.soc=SOC_SET=soc; document.getElementById("soc").value=Math.round(soc); document.getElementById("socOut").textContent=Math.round(soc)+"%"; }
+  if (soc!==S.soc){ S.soc=soc; renderSocInput(); }
 }
 function setKm(key, v){
   const pat=patternKm(new Date(key+"T12:00"), S);
@@ -411,7 +440,8 @@ function setKm(key, v){
 // after a reading far off the estimate, ask about the distance; after planned charging, show the level it assumes.
 function renderSocUpdate(now){
   const box=document.getElementById("socUpdate");
-  const lv=levelEst({...S, soc:SOC_SET}, now), est=lv && lv.trips.length ? lv : null, last=S.socLog[S.socLog.length-1];
+  if (PEND!=null){ box.hidden=true; box.innerHTML=""; return; }
+  const lv=levelEst(S, now), est=lv && lv.trips.length ? lv : null, last=S.socLog[S.socLog.length-1];
   const refocus=document.activeElement && document.activeElement.id==="socKmIn", cpFocus=document.activeElement && document.activeElement.id==="cpKwh";
   const cp=!DEMO && !est && !ASK ? chargePrompt(S, now) : null;
   // The field always edits the whole day's km; say so when only one drive of it is counted
@@ -811,10 +841,36 @@ function bindInputs(){
       recompute();
     });
   });
-  const soc=document.getElementById("soc"), out=document.getElementById("socOut");
-  soc.value=Math.round(S.soc); out.textContent=Math.round(S.soc)+"%";
-  soc.addEventListener("input",()=>{ S.soc=Number(soc.value); out.textContent=S.soc+"%"; recompute(); });
-  soc.addEventListener("change",()=>takeReading());
+  // Battery level: the slider, typing and −/+ only change the level being set (PEND); Save makes it a reading
+  const soc=document.getElementById("soc"), num=document.getElementById("socNum");
+  renderSocInput();
+  soc.addEventListener("input",()=>pend(Number(soc.value)));
+  let typedFrom=null;   // the level being set when typing started, restored if the field is left invalid or empty
+  num.addEventListener("focus",()=>{ typedFrom=PEND; num.select(); });
+  num.addEventListener("input",()=>{
+    const t=num.value.trim(), ok=/^\d{1,3}$/.test(t) && Number(t)<=100;
+    num.setAttribute("aria-invalid", t!=="" && !ok);
+    if (ok) pend(Number(t));
+  });
+  // Leaving the field shows the level being set again; an invalid or empty entry is dropped
+  num.addEventListener("blur",()=>{
+    const t=num.value.trim(), ok=/^\d{1,3}$/.test(t) && Number(t)<=100;
+    if (!ok && PEND!==typedFrom){ PEND=typedFrom; recompute(); }
+    renderSocInput();
+  });
+  num.addEventListener("keydown",e=>{ if (e.key==="Enter"){ e.preventDefault(); num.blur(); } });
+  // −/+: one point per tap, repeating while held; keyboard activation arrives as a click without a pointer
+  for (const [id, d] of [["socDown",-1],["socUp",1]]){
+    const b=document.getElementById(id); let timer=null;
+    const step=()=>pend((PEND ?? Math.round(S.soc))+d);
+    const stop=()=>{ clearTimeout(timer); clearInterval(timer); timer=null; };
+    b.addEventListener("pointerdown",e=>{ if (e.button) return; step(); stop(); timer=setTimeout(()=>{ timer=setInterval(step, 90); }, 450); });
+    for (const ev of ["pointerup","pointerleave","pointercancel","blur"]) b.addEventListener(ev, stop);
+    b.addEventListener("click",e=>{ if (e.detail===0) step(); });
+    b.addEventListener("contextmenu",e=>e.preventDefault());
+  }
+  document.getElementById("socSaveBtn").addEventListener("click",()=>{ takeReading(PEND); num.focus(); });
+  document.getElementById("socCancel").addEventListener("click",()=>{ PEND=null; renderSocInput(); recompute(); num.focus(); });
   // Each link opens its form, or closes it if it is the one open
   document.getElementById("xOpen").addEventListener("click",()=>{
     XD = XD?.kind==="drive" ? null : { kind:"drive", km:"", time:hhmm(Date.now()) }; renderExtra(); if (XD) document.getElementById("xKm").focus();
@@ -906,23 +962,23 @@ function renderLog(){
 
 // Before planned charging of CAP_MIN+ points with no reading of the car since the last drive or charging: ask for
 // one when plugging in, so the session can be logged for the capacity estimate (chargePrompt() needs a read start).
-// "Car shows" confirms the level the app has; moving the slider adjusts it. Both are readings.
+// "Car shows" confirms the level the app has in one tap; adjusting it above and Save does the same. Both are readings.
 function renderPlugNote(P, now){
   const box=document.getElementById("plugNote"), t=now.getTime(), dep=P.events.find(e=>e.check)?.t ?? Infinity;
   const sess=P.blocks.filter(b=>b.end>t && b.start<dep), first=sess[0];
   const pts=sess.reduce((a,b)=>a+b.kwh, 0)*S.effPct/100/P.B*100;
-  if (DEMO || !first || first.start<=t || pts<20 || readStart({...S, soc:SOC_SET}, now)){ box.hidden=true; box.innerHTML=""; return; }
-  const lv=levelEst({...S, soc:SOC_SET}, now), v=lv ? lv.pct : Math.round(SOC_SET), dl=dayLabel(first.start, now);
+  if (DEMO || PEND!=null || !first || first.start<=t || pts<20 || readStart(S, now)){ box.hidden=true; box.innerHTML=""; return; }
+  const lv=levelEst(S, now), v=lv ? lv.pct : Math.round(S.soc), dl=dayLabel(first.start, now);
   box.hidden=false;
   box.innerHTML=`<p class="note">Charging from ${first.start-t<18*H ? "" : dl==="Tomorrow" ? "tomorrow " : dl+" "}${hm5(first.start)}. When you plug in, check the car's level so the charge can be logged for the battery estimate.</p>
-    <div class="row"><button type="button" class="btn ghost" id="plugOk">Car shows ${v}%</button><span class="note">or move the slider</span></div>`;
-  document.getElementById("plugOk").onclick=()=>{ S.soc=v; takeReading(); };
+    <div class="row"><button type="button" class="btn ghost" id="plugOk">Car shows ${v}%</button><span class="note">or adjust it above</span></div>`;
+  document.getElementById("plugOk").onclick=()=>takeReading(v);
 }
 
 function recompute(){
   const now=new Date();
   // Move a day-old level forward to the estimate (not while dragging, nor with example data)
-  const roll=!DEMO && S.soc===SOC_SET ? rollLevel(S, now) : null;
+  const roll=!DEMO && PEND==null ? rollLevel(S, now) : null;
   if (roll){ S.history=addLevel(S.history, roll.soc, "roll", now); setSoc(roll.soc, new Date(roll.socAt)); saveSettings(); }
   // Write what has ended since last time into the history
   if (!DEMO){
@@ -934,9 +990,9 @@ function recompute(){
   if (!DATA) return;
   const {hours, model}=buildHours(DATA.prices, DATA.weather, S, now);
   MODEL=model;
-  // While the slider is dragged, its value is the level now (no drives since to subtract)
+  // While a level is being set, it is the level now (no drives since to subtract)
   const fill=S.fillCheap ? cheapLimit(DATA.prices, S, now) : null;
-  const P=plan(hours, S.soc!==SOC_SET ? {...S, socAt:now.getTime()} : S, now, fill);
+  const P=plan(hours, PEND!=null ? {...S, soc:PEND, socAt:now.getTime()} : S, now, fill);
   // Remember the charging shown, so the next estimate after a drive can assume it was done
   if (!DEMO){
     const pl=notePlanned(S.planned, P, now, S);
