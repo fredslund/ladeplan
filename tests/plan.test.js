@@ -850,10 +850,17 @@ test("history CSV has one row per entry", () => {
   const s = hist("2026-10-18T21:00", s => { s.planned = [[ms("2026-10-19T01:00"), ms("2026-10-19T02:00"), 1]]; });
   const h = addReading(recordHistory(s, new Date("2026-10-19T18:00")).history, null, 61, 58, new Date("2026-10-19T19:00"));
   assert.deepStrictEqual(historyCsv(h).split("\n"), [
-    "start,end,type,km,kwh,pct,est_pct,note",
-    "2026-10-19 01:00,2026-10-19 02:00,charge,,9.9,,,chosen",
-    "2026-10-19 07:30,2026-10-19 17:00,drive,78,-13.26,,,\"17 kWh/100 km, schedule\"",
-    "2026-10-19 19:00,,reading,,,61,,"]);
+    "start,end,type,km,kwh,pct,est_pct,from_pct,note",
+    "2026-10-19 01:00,2026-10-19 02:00,charge,,9.9,,,,chosen",
+    "2026-10-19 07:30,2026-10-19 17:00,drive,78,-13.26,,,,\"17 kWh/100 km, schedule\"",
+    "2026-10-19 19:00,,reading,,,61,,,"]);
+  // Logged charging sessions sit at their end, with the implied capacity and why one is left out
+  const charges = [{ at: ms("2026-10-19T06:00"), from: 31, to: 90, kwh: 35.31, estStart: true, preheat: false },
+    { at: ms("2026-10-19T20:00"), from: 70, to: 85, kwh: 9, estStart: false, preheat: false }];
+  const rows = historyCsv(h, { ...clone(DEF), charges }).split("\n");
+  assert.strictEqual(rows.length, 6);
+  assert.strictEqual(rows[2], ",2026-10-19 06:00,wallbox,,35.31,90,,31,\"53.9 kWh capacity, start estimated\"");
+  assert.strictEqual(rows[5], ",2026-10-19 20:00,wallbox,,9,85,,70,\"54.0 kWh capacity, left out: under 20 points\"");
 });
 
 /* ---------- explaining readings far off the estimate ---------- */

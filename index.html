@@ -1004,8 +1004,8 @@ if (typeof document!=="undefined" && document.getElementById("decision")){
     e.preventDefault(); history.pushState({fromMain:true}, "", a.getAttribute("href")); views();
   });
   document.getElementById("logCsv").addEventListener("click", async ()=>{
-    const csv=historyCsv(S.history), msg=document.getElementById("logCsvMsg"), out=document.getElementById("logCsvOut");
-    try { await navigator.clipboard.writeText(csv); msg.textContent=`Copied ${S.history.length} rows.`; out.hidden=true; }
+    const csv=historyCsv(S.history, S), msg=document.getElementById("logCsvMsg"), out=document.getElementById("logCsvOut");
+    try { await navigator.clipboard.writeText(csv); msg.textContent=`Copied ${csv.split("\n").length-1} rows.`; out.hidden=true; }
     catch(e){ out.value=csv; out.hidden=false; out.select(); msg.textContent="Couldn't copy; select the text below."; }
   });
   views();
