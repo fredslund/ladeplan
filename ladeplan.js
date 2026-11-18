@@ -651,14 +651,18 @@ function correctDrive(history, key, s){
   return history.map(e=>e.k==="drive" && e.date===key && e.src!=="errand" ? {...driveEntry(new Date(key+"T12:00"), s), at:e.at, dep:e.dep} : e);
 }
 // One row per entry, for checking in a spreadsheet.
-function historyCsv(history){
+function historyCsv(history, s=null){
   const ts=t=>`${dateKey(new Date(t))} ${hhmm(t)}`;
   const v=x=>{ const q=x==null ? "" : String(x); return /[",\n]/.test(q) ? `"${q.replace(/"/g,'""')}"` : q; };
-  const rows=history.map(e=>e.k==="drive" ? [ts(e.dep||e.at), e.dep ? ts(e.at) : "", "drive", e.km, -e.kwh, "", "", `${e.cons} kWh/100 km, ${e.src}`]
-    : e.k==="charge" ? [ts(e.at), ts(e.end), "charge", "", e.kwh, "", "", e.chosen ? "chosen" : "assumed"]
-    : e.k==="reading" ? [ts(e.at), "", "reading", "", e.diffKwh, e.pct, e.estPct, e.cause||""]
-    : [ts(e.at), "", "level", "", "", e.pct, "", e.how]);
-  return [["start","end","type","km","kwh","pct","est_pct","note"], ...rows].map(r=>r.map(v).join(",")).join("\n");
+  const rows=history.map(e=>[e.at, e.k==="drive" ? [ts(e.dep||e.at), e.dep ? ts(e.at) : "", "drive", e.km, -e.kwh, "", "", "", `${e.cons} kWh/100 km, ${e.src}`]
+    : e.k==="charge" ? [ts(e.at), ts(e.end), "charge", "", e.kwh, "", "", "", e.chosen ? "chosen" : "assumed"]
+    : e.k==="reading" ? [ts(e.at), "", "reading", "", e.diffKwh, e.pct, e.estPct, "", e.cause||""]
+    : [ts(e.at), "", "level", "", "", e.pct, "", "", e.how]]);
+  // Logged charging sessions (s.charges) at their end: wallbox kWh from from_pct to pct, with the implied capacity
+  if (s) for (const r of capEstimate(s).rows) rows.push([r.at, ["", ts(r.at), "wallbox", "", r.kwh, r.to, "", r.from,
+    [r.B==null ? "no gain" : `${r.B.toFixed(1)} kWh capacity`, r.estStart && "start estimated", r.preheat && "pre-heated", r.why && `left out: ${r.why}`].filter(Boolean).join(", ")]]);
+  rows.sort((a,b)=>a[0]-b[0]);
+  return [["start","end","type","km","kwh","pct","est_pct","from_pct","note"], ...rows.map(r=>r[1])].map(r=>r.map(v).join(",")).join("\n");
 }
 
 /* ---------- decision card ---------- */
